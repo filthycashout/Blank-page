@@ -1318,17 +1318,17 @@ class _SettingsPageState extends State<SettingsPage> {
                   ),
                 ] else ...[
                   Text(
-                    'Credential rotation: ${_asMap(_asMap(_systemStatus!['security']))['credential_rotation_confirmed'] == true ? 'CONFIRMED' : 'PENDING'}',
+                    'Credential rotation: ${_asMap(_systemStatus!['gates'])['credential_rotation'] ?? 'UNKNOWN'}',
                   ),
                   Text(
-                    'Private-provider execution: ${_asMap(_asMap(_systemStatus!['security']))['private_provider_execution'] ?? 'UNKNOWN'}',
+                    'Release state: ${_systemStatus!['release_state'] ?? 'UNKNOWN'}',
                   ),
                   const SizedBox(height: 8),
                   ...sportSpecs.map((sport) {
                     final sports = _asMap(_modelsStatus?['sports']);
                     final row = _asMap(sports[sport.key]);
                     return Text(
-                      '${sport.key}: ${row['mode'] ?? 'MARKET_BASELINE_ONLY'}',
+                      '${sport.key}: ${row['production_state'] ?? 'MARKET_BASELINE_ONLY'} · ${row['candidate_state'] ?? 'CANDIDATE_SHADOW'}',
                     );
                   }),
                 ],
