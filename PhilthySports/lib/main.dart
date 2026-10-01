@@ -1086,7 +1086,7 @@ class _ParlayPageState extends State<ParlayPage> {
             icon: Icons.layers,
             title: 'BetP v3 multi-parlay engine',
             subtitle:
-                '7-leg conservative · 10-leg conservative · 14-leg aggressive · fixed $3 bankroll',
+                r'7-leg conservative · 10-leg conservative · 14-leg aggressive · fixed $3 bankroll',
           ),
           const SizedBox(height: 10),
           if (_legs.isEmpty)
