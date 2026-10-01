@@ -40,6 +40,24 @@ jobs:
           unzip -t EntertainmentHubTV.rebuilt.zip
           unzip -q EntertainmentHubTV.rebuilt.zip -d extracted
 
+      - name: Normalize JVM target
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("extracted/EntertainmentHubTV/app/build.gradle.kts")
+          s = p.read_text()
+          marker = "    buildFeatures { compose = true }"
+          if "sourceCompatibility = JavaVersion.VERSION_17" not in s:
+              s = s.replace(marker, marker + """
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }""")
+          p.write_text(s)
+          PY
+
       - name: Build debug APK
         working-directory: extracted/EntertainmentHubTV
         run: gradle :app:assembleDebug --stacktrace
