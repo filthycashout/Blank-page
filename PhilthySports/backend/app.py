@@ -969,6 +969,7 @@ def _validate_odds_payload(payload: Any) -> tuple[list[dict[str, Any]], dict[str
     now = datetime.now(timezone.utc)
     accepted: list[dict[str, Any]] = []
     rejected_schema = 0
+    rejected_started = 0
     rejected_stale = 0
     fresh_bookmakers = 0
     stale_bookmakers = 0
@@ -980,6 +981,14 @@ def _validate_odds_payload(payload: Any) -> tuple[list[dict[str, Any]], dict[str
 
         if not all(raw.get(key) for key in ("id", "home_team", "away_team", "commence_time")):
             rejected_schema += 1
+            continue
+
+        commence_time = _parse_provider_time(raw.get("commence_time"))
+        if commence_time is None:
+            rejected_schema += 1
+            continue
+        if commence_time <= now:
+            rejected_started += 1
             continue
 
         bookmakers = raw.get("bookmakers")
@@ -1017,6 +1026,7 @@ def _validate_odds_payload(payload: Any) -> tuple[list[dict[str, Any]], dict[str
         "schema_valid": rejected_schema == 0,
         "accepted_events": len(accepted),
         "rejected_schema_events": rejected_schema,
+        "rejected_started_events": rejected_started,
         "rejected_stale_events": rejected_stale,
         "fresh_bookmakers": fresh_bookmakers,
         "stale_bookmakers": stale_bookmakers,
