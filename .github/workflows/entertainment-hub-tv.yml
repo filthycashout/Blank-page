@@ -43,7 +43,7 @@ jobs:
       - name: Normalize JVM target
         shell: bash
         run: |
-          python3 -c 'from pathlib import Path; p=Path("extracted/EntertainmentHubTV/app/build.gradle.kts"); s=p.read_text(); m="    buildFeatures { compose = true }"; b="\\n\\n    compileOptions {\\n        sourceCompatibility = JavaVersion.VERSION_17\\n        targetCompatibility = JavaVersion.VERSION_17\\n    }"; p.write_text(s if "sourceCompatibility = JavaVersion.VERSION_17" in s else s.replace(m, m+b))'
+          python3 -c 'from pathlib import Path; p=Path("extracted/EntertainmentHubTV/app/build.gradle.kts"); s=p.read_text(); m="    buildFeatures { compose = true }"; b="\n\n    compileOptions {\n        sourceCompatibility = JavaVersion.VERSION_17\n        targetCompatibility = JavaVersion.VERSION_17\n    }"; p.write_text(s if "sourceCompatibility = JavaVersion.VERSION_17" in s else s.replace(m, m+b))'
       - name: Build debug APK
         working-directory: extracted/EntertainmentHubTV
         run: gradle :app:assembleDebug --stacktrace
