@@ -20,7 +20,7 @@ load_dotenv()
 
 app = FastAPI(
     title="PhilthySports API",
-    version="1.2.0-v6-bridge",
+    version="1.2.1-final-audit",
     description="Unified NFL, NBA, MLB and NHL prediction bridge.",
 )
 
@@ -645,7 +645,7 @@ def health() -> dict[str, Any]:
     return {
         "status": "ok",
         "service": "PhilthySports",
-        "version": "1.2.0-v6-bridge",
+        "version": "1.2.1-final-audit",
         "engine": os.getenv("PHILTHY_ENGINE_MODE", "provisional_shadow"),
         "live_gate": gates["credential_rotation"],
         "pass_for_live": gates["pass_for_live"],
@@ -657,7 +657,7 @@ def health() -> dict[str, Any]:
 def system_status() -> dict[str, Any]:
     return {
         "service": "PhilthySports",
-        "version": "1.2.0-v6-bridge",
+        "version": "1.2.1-final-audit",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "gates": _system_gates(),
         "release_state": (
