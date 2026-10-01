@@ -40,10 +40,15 @@ jobs:
           unzip -t EntertainmentHubTV.rebuilt.zip
           unzip -q EntertainmentHubTV.rebuilt.zip -d extracted
 
+      - name: Apply v3 no-login feature pass
+        shell: bash
+        run: python3 scripts/entertainment_hub_v3_patch.py
+
       - name: Normalize JVM target
         shell: bash
         run: |
           python3 -c 'from pathlib import Path; p=Path("extracted/EntertainmentHubTV/app/build.gradle.kts"); s=p.read_text(); m="    buildFeatures { compose = true }"; b="\n\n    compileOptions {\n        sourceCompatibility = JavaVersion.VERSION_17\n        targetCompatibility = JavaVersion.VERSION_17\n    }"; p.write_text(s if "sourceCompatibility = JavaVersion.VERSION_17" in s else s.replace(m, m+b))'
+
       - name: Build debug APK
         working-directory: extracted/EntertainmentHubTV
         run: gradle :app:assembleDebug --stacktrace
@@ -57,10 +62,23 @@ jobs:
           APKSIGNER="$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -n 1)"
           test -x "$APKSIGNER"
           "$APKSIGNER" verify --verbose --print-certs "$APK"
+          sha256sum "$APK"
           ls -lh "$APK"
+
+      - name: Package patched source
+        shell: bash
+        run: |
+          cd extracted
+          zip -qr ../EntertainmentHubTV-v3-source.zip EntertainmentHubTV
 
       - uses: actions/upload-artifact@v4
         with:
-          name: entertainment-hub-tv-debug-apk
+          name: entertainment-hub-tv-v3-debug-apk
           path: extracted/EntertainmentHubTV/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: entertainment-hub-tv-v3-source
+          path: EntertainmentHubTV-v3-source.zip
           if-no-files-found: error
