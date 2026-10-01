@@ -85,3 +85,23 @@ Current production-safe state:
 - The APK Settings screen displays the backend credential-rotation and model-promotion gates when connected.
 
 The v6 summary supplied in chat describes walk-forward training, OOF calibration, CLV/settlement, live-odds freshness validation and measured parlay dependency. Their original implementation files were not supplied here, so this repository does not invent their missing algorithms or schemas. The integration boundary is ready for those verified modules when their actual source is available.
+
+
+## v6 governance bridge
+
+The app now surfaces model and security state rather than treating a successful compile as model promotion.
+
+Backend read endpoints include:
+
+- `/health`
+- `/v1/system/status`
+- `/v1/models/status`
+- `/v1/predictions/latest`
+- `/v1/predictions/{sport}`
+- `/v1/runs/latest`
+- `/v1/parlays`
+- `/v1/odds/{sport}`
+
+The BetP on-device engine is labeled `PROVISIONAL_SHADOW`. Production policy remains `MARKET_BASELINE_ONLY` until canonical pregame history and chronological promotion evidence exist. Live secret-backed odds fail closed until provider credential rotation is explicitly confirmed.
+
+See `docs/V6_INTEGRATION_STATUS.md`.
