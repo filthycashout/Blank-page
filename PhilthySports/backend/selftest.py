@@ -80,6 +80,50 @@ def main() -> None:
     assert quality["accepted_events"] == 1
     assert quality["fresh_bookmakers"] == 1
 
+    market_event = {
+        "id": "market-1",
+        "home_team": "Home Club",
+        "away_team": "Away Club",
+        "commence_time": (now + timedelta(hours=2)).isoformat(),
+        "bookmakers": [
+            {
+                "key": "book-a",
+                "last_update": now.isoformat(),
+                "markets": [
+                    {
+                        "key": "h2h",
+                        "outcomes": [
+                            {"name": "Home Club", "price": -120},
+                            {"name": "Away Club", "price": 110},
+                        ],
+                    },
+                    {
+                        "key": "spreads",
+                        "outcomes": [
+                            {"name": "Home Club", "price": -110, "point": -2.5},
+                            {"name": "Away Club", "price": -110, "point": 2.5},
+                        ],
+                    },
+                    {
+                        "key": "totals",
+                        "outcomes": [
+                            {"name": "Over", "price": -110, "point": 47.5},
+                            {"name": "Under", "price": -110, "point": 47.5},
+                        ],
+                    },
+                ],
+            }
+        ],
+    }
+    built = backend._market_baseline_prediction(market_event, "nfl")
+    assert built is not None
+    market_game, market_prediction = built
+    assert market_game["state"] == "pre"
+    assert market_prediction.engine == "De-vigged market consensus baseline v1"
+    assert market_prediction.total_lean == "MARKET 47.5"
+    assert market_prediction.total_confidence == 0.0
+    assert 0 < market_prediction.home_win_probability < 1
+
     stale_payload = [{
         **fresh_payload[0],
         "id": "odds-stale",
