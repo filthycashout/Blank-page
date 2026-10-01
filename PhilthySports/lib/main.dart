@@ -949,8 +949,8 @@ class _ParlayPageState extends State<ParlayPage> {
                       value: decimal.toStringAsFixed(2),
                     ),
                     StatBlock(
-                      label: '$3 MODEL VALUE',
-                      value: '$${modelPayout.toStringAsFixed(2)}',
+                      label: '\\$3 MODEL VALUE',
+                      value: '\\$\${modelPayout.toStringAsFixed(2)}',
                     ),
                   ],
                 ),
