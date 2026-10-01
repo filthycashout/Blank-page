@@ -4,6 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches:
+      - main
       - all-in-one-entertainment-tv
 
 jobs:
@@ -21,11 +22,15 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.10.2'
-      - name: Extract project
-        run: unzip -q EntertainmentHubTV.zip -d extracted
+      - name: Extract Entertainment Hub TV
+        run: |
+          rm -rf extracted
+          unzip -q EntertainmentHubTV.zip -d extracted
       - name: Build debug APK
         working-directory: extracted/EntertainmentHubTV
         run: gradle :app:assembleDebug --stacktrace
+      - name: Verify APK
+        run: test -s extracted/EntertainmentHubTV/app/build/outputs/apk/debug/app-debug.apk
       - uses: actions/upload-artifact@v4
         with:
           name: entertainment-hub-tv-debug-apk
