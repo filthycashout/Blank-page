@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import os
 import time
@@ -72,8 +73,141 @@ KNOWN_MLB_STRENGTH = {
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "300"))
 ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports"
 ODDS_BASE = "https://api.the-odds-api.com/v4"
+LEDGER_PATH = os.getenv(
+    "PREDICTION_LEDGER_PATH",
+    "/tmp/philthysports_prediction_ledger.jsonl",
+)
+
+MASTER_PROTOCOL = [
+    "Understand",
+    "Decompose",
+    "Inspect",
+    "Map",
+    "Challenge",
+    "Plan",
+    "Act",
+    "Verify",
+    "Recalibrate",
+    "Explain",
+    "Retain",
+    "Improve",
+]
+
+EXPERIMENT_LOOP = [
+    "Evidence",
+    "Hypothesis",
+    "Smallest Experiment",
+    "Result",
+    "Update",
+    "Regression Check",
+]
+
+OPERATING_SEQUENCE = [
+    "Secure",
+    "Ingest",
+    "Validate",
+    "Version",
+    "Train",
+    "Promote/Shadow",
+    "Freeze Live Snapshot",
+    "Predict",
+    "Ledger",
+    "Capture Close",
+    "Settle",
+    "CLV",
+    "Recalibrate",
+    "Verify",
+    "Release",
+]
 
 _cache: dict[str, tuple[float, Any, str]] = {}
+
+
+def _env_true(name: str) -> bool:
+    return str(os.getenv(name, "")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+        "confirmed",
+    }
+
+
+def _provider_status() -> dict[str, bool]:
+    return {
+        "odds_api_configured": bool(os.getenv("ODDS_API_KEY")),
+        "sportradar_configured": bool(os.getenv("SPORTRADAR_API_KEY")),
+        "visual_crossing_configured": bool(os.getenv("VISUAL_CROSSING_API_KEY")),
+        "google_sheets_configured": bool(os.getenv("GOOGLE_SHEETS_ID")),
+        "google_cloud_configured": bool(os.getenv("GCLOUD_PROJECT_ID")),
+    }
+
+
+def _model_gate_status() -> dict[str, dict[str, Any]]:
+    reason = (
+        "No verified promoted game-winner model artifact with qualifying "
+        "timestamped pregame evidence is bundled for this sport in this build."
+    )
+    return {
+        sport.upper(): {
+            "mode": "MARKET_BASELINE_ONLY",
+            "promoted": False,
+            "shadow_eligible": False,
+            "reason": reason,
+        }
+        for sport in SPORTS
+    }
+
+
+def _ledger_append(event_type: str, payload: dict[str, Any]) -> str:
+    """Append a tamper-evident hash-chained ledger record.
+
+    This is append-only at the application layer. Filesystem/object-store
+    immutability must be supplied by the deployment platform if required.
+    """
+    directory = os.path.dirname(LEDGER_PATH)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+
+    previous_hash = ""
+    if os.path.exists(LEDGER_PATH):
+        try:
+            with open(LEDGER_PATH, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        previous_hash = str(json.loads(line).get("record_hash") or "")
+                    except json.JSONDecodeError:
+                        continue
+        except OSError:
+            previous_hash = ""
+
+    unsigned = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "event_type": event_type,
+        "previous_hash": previous_hash,
+        "payload": payload,
+    }
+    canonical = json.dumps(
+        unsigned,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    record_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    record = {**unsigned, "record_hash": record_hash}
+
+    try:
+        with open(LEDGER_PATH, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True, default=str) + "\n")
+    except OSError:
+        return ""
+
+    return record_hash
+
 
 
 @dataclass(frozen=True)
@@ -374,15 +508,86 @@ def health() -> dict[str, Any]:
     return {
         "status": "ok",
         "service": "PhilthySports",
-        "version": "1.1.0",
-        "engine": os.getenv("PHILTHY_ENGINE_MODE", "baseline"),
-        "providers": {
-            "odds_api_configured": bool(os.getenv("ODDS_API_KEY")),
-            "sportradar_configured": bool(os.getenv("SPORTRADAR_API_KEY")),
-            "visual_crossing_configured": bool(os.getenv("VISUAL_CROSSING_API_KEY")),
-            "google_sheets_configured": bool(os.getenv("GOOGLE_SHEETS_ID")),
-            "google_cloud_configured": bool(os.getenv("GCLOUD_PROJECT_ID")),
+        "version": "1.2.0",
+        "protocol_version": "v6 integration",
+        "engine": os.getenv("PHILTHY_ENGINE_MODE", "market_baseline_only"),
+        "providers": _provider_status(),
+        "gates": {
+            "credential_rotation_confirmed": _env_true(
+                "CREDENTIAL_ROTATION_CONFIRMED"
+            ),
+            "all_four_sports_promoted": False,
         },
+    }
+
+
+@app.get("/v1/system/status")
+def system_status() -> dict[str, Any]:
+    rotation_confirmed = _env_true("CREDENTIAL_ROTATION_CONFIRMED")
+    return {
+        "service": "PhilthySports",
+        "version": "1.2.0",
+        "protocol_version": "v6 integration",
+        "master_protocol": MASTER_PROTOCOL,
+        "experiment_loop": EXPERIMENT_LOOP,
+        "operating_sequence": OPERATING_SEQUENCE,
+        "security": {
+            "credential_rotation_confirmed": rotation_confirmed,
+            "private_provider_execution": (
+                "ENABLED" if rotation_confirmed else "BLOCKED_PENDING_ROTATION"
+            ),
+            "apk_embeds_private_provider_keys": False,
+        },
+        "execution": {
+            "keyless_espn_baseline": "AVAILABLE",
+            "market_baseline_mode": "AVAILABLE",
+            "promoted_four_sport_models": "NOT_AVAILABLE",
+        },
+        "providers": _provider_status(),
+        "remaining_gates": [
+            "Confirm provider credential rotation before private-provider live execution.",
+            "Supply and pass qualifying timestamped pregame training evidence before promoting game-winner models.",
+        ],
+    }
+
+
+@app.get("/v1/models/status")
+def models_status() -> dict[str, Any]:
+    return {
+        "promotion_policy": {
+            "default_mode": "MARKET_BASELINE_ONLY",
+            "no_synthetic_history": True,
+            "pregame_timestamp_required": True,
+            "mismatched_model_artifacts_rejected": True,
+        },
+        "sports": _model_gate_status(),
+    }
+
+
+@app.get("/v1/ledger/status")
+def ledger_status() -> dict[str, Any]:
+    records = 0
+    last_hash = ""
+    if os.path.exists(LEDGER_PATH):
+        try:
+            with open(LEDGER_PATH, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    if not line.strip():
+                        continue
+                    records += 1
+                    try:
+                        last_hash = str(json.loads(line).get("record_hash") or last_hash)
+                    except json.JSONDecodeError:
+                        pass
+        except OSError:
+            pass
+
+    return {
+        "path": LEDGER_PATH,
+        "records": records,
+        "last_record_hash": last_hash,
+        "mode": "append_only_hash_chain",
+        "storage_immutability": "deployment_dependent",
     }
 
 
@@ -418,7 +623,7 @@ def predictions(
             }
         )
 
-    return {
+    response_payload = {
         "sport": sport_key.upper(),
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "engine": "Philthy Baseline v1.1 · BetP v3 deterministic port",
@@ -433,10 +638,62 @@ def predictions(
             "generated_at": datetime.now(timezone.utc).isoformat(),
         },
         "governance": {
-            "mode": "baseline",
-            "powerhouse_bridge": "ready_for_deployment",
+            "mode": "MARKET_BASELINE_ONLY",
+            "model_promoted": False,
+            "powerhouse_bridge": "ready_for_verified_model_artifacts",
             "private_provider_keys_embedded_in_apk": False,
         },
+    }
+    ledger_hash = _ledger_append(
+        "prediction_batch",
+        {
+            "sport": sport_key.upper(),
+            "snapshot_sha256": snapshot,
+            "games_predicted": len(rows),
+            "engine": response_payload["engine"],
+            "governance_mode": response_payload["governance"]["mode"],
+        },
+    )
+    response_payload["ledger_record_hash"] = ledger_hash
+    return response_payload
+
+
+@app.get("/v1/predictions/latest")
+def latest_predictions(days: int = Query(2, ge=1, le=7)) -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    snapshots: list[str] = []
+
+    for sport_key in SPORTS:
+        games, snapshot = fetch_games(sport_key, days)
+        snapshots.append(snapshot)
+        for game in games:
+            if not _strict_upcoming(game):
+                continue
+            rows.append({
+                "game": game,
+                "prediction": predict_game(game).as_dict(),
+                "governance_mode": "MARKET_BASELINE_ONLY",
+            })
+
+    rows.sort(key=lambda item: str(item["game"].get("date") or ""))
+    combined_snapshot = hashlib.sha256(
+        "".join(snapshots).encode("utf-8")
+    ).hexdigest()
+    ledger_hash = _ledger_append(
+        "latest_predictions",
+        {
+            "snapshot_sha256": combined_snapshot,
+            "predictions": len(rows),
+            "sports": sorted({item["game"]["sport"] for item in rows}),
+        },
+    )
+
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "snapshot_sha256": combined_snapshot,
+        "governance_mode": "MARKET_BASELINE_ONLY",
+        "ledger_record_hash": ledger_hash,
+        "predictions": rows,
     }
 
 
