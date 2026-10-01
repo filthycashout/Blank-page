@@ -1603,8 +1603,9 @@ class PredictionCard extends StatelessWidget {
                 StatBlock(label: 'SPREAD', value: p.spreadLean),
                 StatBlock(
                   label: 'TOTAL',
-                  value:
-                      '${p.totalLean} ${(p.totalConfidence * 100).toStringAsFixed(0)}%',
+                  value: p.totalConfidence > 0
+                      ? '${p.totalLean} ${(p.totalConfidence * 100).toStringAsFixed(0)}%'
+                      : p.totalLean,
                 ),
                 StatBlock(label: 'HOME TT', value: p.homeTeamTotal),
                 StatBlock(label: 'AWAY TT', value: p.awayTeamTotal),
