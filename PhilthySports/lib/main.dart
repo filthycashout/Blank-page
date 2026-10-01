@@ -173,6 +173,9 @@ class Prediction {
   final String spreadLean;
   final String totalLean;
   final double totalConfidence;
+  final String homeTeamTotal;
+  final String awayTeamTotal;
+  final String projectedOutcome;
   final String engine;
 
   const Prediction({
@@ -183,6 +186,9 @@ class Prediction {
     required this.spreadLean,
     required this.totalLean,
     required this.totalConfidence,
+    required this.homeTeamTotal,
+    required this.awayTeamTotal,
+    required this.projectedOutcome,
     required this.engine,
   });
 
@@ -195,6 +201,9 @@ class Prediction {
       spreadLean: (j['spread_lean'] ?? 'PASS').toString(),
       totalLean: (j['total_lean'] ?? 'NO LEAN').toString(),
       totalConfidence: _toDouble(j['total_confidence'], 0.5),
+      homeTeamTotal: (j['home_team_total'] ?? 'UNKNOWN').toString(),
+      awayTeamTotal: (j['away_team_total'] ?? 'UNKNOWN').toString(),
+      projectedOutcome: (j['projected_outcome'] ?? 'UNKNOWN').toString(),
       engine: (j['engine'] ?? 'unknown').toString(),
     );
   }
@@ -207,6 +216,9 @@ class Prediction {
         'spread_lean': spreadLean,
         'total_lean': totalLean,
         'total_confidence': totalConfidence,
+        'home_team_total': homeTeamTotal,
+        'away_team_total': awayTeamTotal,
+        'projected_outcome': projectedOutcome,
         'engine': engine,
       };
 }
@@ -408,8 +420,14 @@ class PredictionEngine {
     final ratingDiff = homeStrength - awayStrength;
     final base =
         1 / (1 + math.exp(-5.5 * (ratingDiff + homeAdvantage)));
-    final jitter = _deterministicJitter(game.id);
-    final homeProbability = (base + jitter).clamp(0.29, 0.81).toDouble();
+
+    // BetP v3 used bounded random variance. For a mobile build we keep the
+    // same ranges but derive the variance from the game id so refreshes are
+    // reproducible instead of changing the pick every run.
+    final probabilityNoise =
+        _deterministicUniform(game.id, 'ml', -0.065, 0.065);
+    final homeProbability =
+        (base + probabilityNoise).clamp(0.29, 0.81).toDouble();
 
     final pick = homeProbability >= 0.53
         ? game.homeAbbr
@@ -421,20 +439,29 @@ class PredictionEngine {
     final moneyline =
         pick == 'PASS' ? 0 : _americanMoneyline(selectedProbability);
 
+    // The source notebook fixes spread output at exactly 2.5.
     final spread = homeProbability > 0.55
         ? '${game.homeAbbr} -2.5'
-        : homeProbability < 0.45
-            ? '${game.awayAbbr} +2.5'
-            : 'PASS';
+        : '${game.awayAbbr} +2.5';
 
-    final overProbability = (0.49 +
-            ((selectedProbability - 0.5) * 0.32) +
-            (jitter * 0.25))
+    final overProbability = ((homeProbability * 0.34) +
+            _deterministicUniform(game.id, 'ou', 0.39, 0.71))
         .clamp(0.36, 0.83)
         .toDouble();
-    final totalLean = overProbability > 0.523 ? 'OVER lean' : 'UNDER lean';
+    final total = overProbability > 0.523 ? 'OVER' : 'UNDER';
     final totalConfidence =
         ((overProbability - 0.5).abs() * 2.25).clamp(0.38, 0.92).toDouble();
+
+    final homeTeamTotal =
+        (homeProbability > 0.52 && overProbability > 0.5)
+            ? 'OVER 2.5'
+            : 'UNDER 2.5';
+    final awayTeamTotal =
+        ((1 - homeProbability) > 0.52 && overProbability > 0.5)
+            ? 'OVER 2.5'
+            : 'UNDER 2.5';
+    final side = homeProbability > 0.5 ? game.homeAbbr : game.awayAbbr;
+    final projectedOutcome = '$side ML + $total';
 
     return Prediction(
       homeWinProbability: homeProbability,
@@ -442,9 +469,12 @@ class PredictionEngine {
       pickConfidence: selectedProbability,
       moneyline: moneyline,
       spreadLean: spread,
-      totalLean: totalLean,
+      totalLean: total,
       totalConfidence: totalConfidence,
-      engine: 'Philthy Baseline v1 · BetP v3-derived',
+      homeTeamTotal: homeTeamTotal,
+      awayTeamTotal: awayTeamTotal,
+      projectedOutcome: projectedOutcome,
+      engine: 'Philthy Baseline v1.1.1 · BetP v3 deterministic port',
     );
   }
 
@@ -462,10 +492,16 @@ class PredictionEngine {
     return (wins / total).clamp(0.15, 0.85).toDouble();
   }
 
-  double _deterministicJitter(String id) {
-    final hex = md5.convert(utf8.encode(id)).toString().substring(0, 4);
-    final unit = int.parse(hex, radix: 16) / 65535.0;
-    return (unit - 0.5) * 0.035;
+  double _deterministicUniform(
+    String id,
+    String salt,
+    double min,
+    double max,
+  ) {
+    final hex =
+        md5.convert(utf8.encode('$id|$salt')).toString().substring(0, 8);
+    final unit = int.parse(hex, radix: 16) / 0xffffffff;
+    return min + ((max - min) * unit);
   }
 
   int _americanMoneyline(double probability) {
@@ -846,6 +882,22 @@ class _PicksPageState extends State<PicksPage> {
   }
 }
 
+class _ParlayLeg {
+  final String sport;
+  final String matchup;
+  final String market;
+  final String pick;
+  final double probability;
+
+  const _ParlayLeg({
+    required this.sport,
+    required this.matchup,
+    required this.market,
+    required this.pick,
+    required this.probability,
+  });
+}
+
 class ParlayPage extends StatefulWidget {
   const ParlayPage({super.key});
 
@@ -857,7 +909,7 @@ class _ParlayPageState extends State<ParlayPage> {
   final _repo = PredictionRepository();
   bool _loading = true;
   String? _error;
-  List<PredictionRecord> _legs = const [];
+  List<_ParlayLeg> _legs = const [];
 
   @override
   void initState() {
@@ -874,21 +926,146 @@ class _ParlayPageState extends State<ParlayPage> {
       final bundles = await Future.wait(
         sportSpecs.map((spec) => _repo.fetch(spec)),
       );
-      final all = bundles.expand((b) => b.records).where((r) {
-        return r.prediction.pick != 'PASS';
-      }).toList()
-        ..sort(
-          (a, b) => b.prediction.pickConfidence
-              .compareTo(a.prediction.pickConfidence),
-        );
+
+      final candidates = <_ParlayLeg>[];
+      for (final record in bundles.expand((b) => b.records)) {
+        final game = record.game;
+        final p = record.prediction;
+        final matchup = '${game.awayAbbr} @ ${game.homeAbbr}';
+
+        if (p.pick != 'PASS') {
+          candidates.add(
+            _ParlayLeg(
+              sport: game.sport,
+              matchup: matchup,
+              market: 'ML',
+              pick: p.pick,
+              probability: p.pickConfidence,
+            ),
+          );
+        }
+
+        if (p.homeWinProbability > 0.58) {
+          candidates.add(
+            _ParlayLeg(
+              sport: game.sport,
+              matchup: matchup,
+              market: 'SPREAD 2.5',
+              pick: '${game.homeAbbr} -2.5',
+              probability: math.min(0.68, p.homeWinProbability + 0.04),
+            ),
+          );
+        }
+
+        final awayProbability = 1 - p.homeWinProbability;
+        if (awayProbability > 0.58) {
+          candidates.add(
+            _ParlayLeg(
+              sport: game.sport,
+              matchup: matchup,
+              market: 'SPREAD 2.5',
+              pick: '${game.awayAbbr} +2.5',
+              probability: math.min(0.68, awayProbability + 0.04),
+            ),
+          );
+        }
+      }
+
+      candidates.sort((a, b) => b.probability.compareTo(a.probability));
       if (!mounted) return;
-      setState(() => _legs = all.take(math.min(14, all.length)).toList());
+      setState(() => _legs = candidates.take(math.min(14, candidates.length)).toList());
     } catch (e) {
       if (!mounted) return;
       setState(() => _error = e.toString());
     } finally {
       if (mounted) setState(() => _loading = false);
     }
+  }
+
+  Widget _parlayCard(String title, int targetLegs, {required bool aggressive}) {
+    final selected = _legs.take(math.min(targetLegs, _legs.length)).toList();
+    if (selected.isEmpty) return const SizedBox.shrink();
+
+    var jointProbability = 1.0;
+    for (final leg in selected) {
+      jointProbability *= leg.probability;
+    }
+    final decimal = jointProbability > 0 ? 1 / jointProbability : 0.0;
+    const bankroll = 3.0;
+    final payout = bankroll * decimal;
+
+    return Card(
+      margin: const EdgeInsets.only(bottom: 12),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    title,
+                    style: const TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.w900,
+                    ),
+                  ),
+                ),
+                Chip(
+                  label: Text(aggressive ? 'AGGRESSIVE' : 'CONSERVATIVE'),
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            Wrap(
+              spacing: 18,
+              runSpacing: 10,
+              children: [
+                StatBlock(label: 'LEGS', value: selected.length.toString()),
+                StatBlock(
+                  label: 'MODEL JOINT P',
+                  value: '${(jointProbability * 100).toStringAsFixed(2)}%',
+                ),
+                StatBlock(
+                  label: 'FAIR DECIMAL',
+                  value: decimal.toStringAsFixed(2),
+                ),
+                StatBlock(
+                  label: r'$3 MODEL VALUE',
+                  value: r'$' + payout.toStringAsFixed(2),
+                ),
+              ],
+            ),
+            const Divider(height: 24),
+            ...selected.asMap().entries.map((entry) {
+              final leg = entry.value;
+              return Padding(
+                padding: const EdgeInsets.only(bottom: 9),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    SizedBox(
+                      width: 28,
+                      child: Text(
+                        '${entry.key + 1}.',
+                        style: const TextStyle(fontWeight: FontWeight.w800),
+                      ),
+                    ),
+                    Expanded(
+                      child: Text(
+                        '${leg.sport} · ${leg.matchup} · ${leg.market}\n'
+                        '${leg.pick} · ${(leg.probability * 100).toStringAsFixed(1)}%',
+                      ),
+                    ),
+                  ],
+                ),
+              );
+            }),
+          ],
+        ),
+      ),
+    );
   }
 
   @override
@@ -900,16 +1077,6 @@ class _ParlayPageState extends State<ParlayPage> {
       return ErrorPanel(message: _error!, onRetry: _load);
     }
 
-    final selected = _legs.take(math.min(7, _legs.length)).toList();
-    var jointProbability = 1.0;
-    for (final leg in selected) {
-      jointProbability *= leg.prediction.pickConfidence;
-    }
-    final decimal =
-        jointProbability > 0 ? 1 / jointProbability : 0.0;
-    const stake = 3.0;
-    final modelPayout = decimal * stake;
-
     return RefreshIndicator(
       onRefresh: _load,
       child: ListView(
@@ -917,66 +1084,24 @@ class _ParlayPageState extends State<ParlayPage> {
         children: [
           const InfoBanner(
             icon: Icons.layers,
-            title: 'Cross-sport conservative builder',
+            title: 'BetP v3 multi-parlay engine',
             subtitle:
-                'Top confidence pregame ML legs · NFL + NBA + MLB + NHL',
+                '7-leg conservative · 10-leg conservative · 14-leg aggressive · fixed $3 bankroll',
           ),
           const SizedBox(height: 10),
-          if (selected.isEmpty)
+          if (_legs.isEmpty)
             const EmptyPanel(
               title: 'Not enough upcoming games',
               text: 'Refresh later as new schedules enter the ESPN feed.',
             )
           else ...[
-            Card(
-              child: Padding(
-                padding: const EdgeInsets.all(16),
-                child: Wrap(
-                  spacing: 20,
-                  runSpacing: 12,
-                  children: [
-                    StatBlock(
-                      label: 'LEGS',
-                      value: selected.length.toString(),
-                    ),
-                    StatBlock(
-                      label: 'MODEL JOINT P',
-                      value:
-                          '${(jointProbability * 100).toStringAsFixed(2)}%',
-                    ),
-                    StatBlock(
-                      label: 'FAIR DECIMAL',
-                      value: decimal.toStringAsFixed(2),
-                    ),
-                    StatBlock(
-                      label: r'$3 MODEL VALUE',
-                      value: r'$' + modelPayout.toStringAsFixed(2),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-            const SizedBox(height: 8),
-            ...selected.asMap().entries.map((entry) {
-              final index = entry.key + 1;
-              final record = entry.value;
-              return Card(
-                child: ListTile(
-                  leading: CircleAvatar(child: Text(index.toString())),
-                  title: Text(
-                    '${record.game.awayAbbr} @ ${record.game.homeAbbr} · ${record.prediction.pick}',
-                    style: const TextStyle(fontWeight: FontWeight.w700),
-                  ),
-                  subtitle: Text(
-                    '${record.game.sport} · confidence ${(record.prediction.pickConfidence * 100).toStringAsFixed(1)}% · ML ${_formatMoneyline(record.prediction.moneyline)}',
-                  ),
-                ),
-              );
-            }),
-            const SizedBox(height: 8),
+            _parlayCard('7-LEG CONSERVATIVE', 7, aggressive: false),
+            _parlayCard('10-LEG CONSERVATIVE', 10, aggressive: false),
+            _parlayCard('14-LEG AGGRESSIVE', 14, aggressive: true),
             const Text(
               'Fair decimal and payout are model-derived estimates only. '
-              'They are not sportsbook odds and do not account for leg correlation or bookmaker margin.',
+              'They are not sportsbook odds and do not account for correlation, '
+              'bookmaker margin, limits, or leg eligibility.',
               style: TextStyle(fontSize: 12, color: Colors.white60),
             ),
           ],
@@ -1159,7 +1284,7 @@ class _SettingsPageState extends State<SettingsPage> {
           child: Padding(
             padding: EdgeInsets.all(16),
             child: Text(
-              'Build: PhilthySports 1.0.0\n'
+              'Build: PhilthySports 1.1.0\n'
               'Direct mode: ESPN scoreboard + BetP v3-derived baseline\n'
               'Backend mode: /v1/predictions/{sport}\n'
               'Sports: NFL · NBA · MLB · NHL',
@@ -1387,7 +1512,14 @@ class PredictionCard extends StatelessWidget {
                   value:
                       '${p.totalLean} ${(p.totalConfidence * 100).toStringAsFixed(0)}%',
                 ),
+                StatBlock(label: 'HOME TT', value: p.homeTeamTotal),
+                StatBlock(label: 'AWAY TT', value: p.awayTeamTotal),
               ],
+            ),
+            const SizedBox(height: 10),
+            Text(
+              'Projected outcome: ${p.projectedOutcome}',
+              style: const TextStyle(fontWeight: FontWeight.w700),
             ),
             const SizedBox(height: 14),
             Text(
