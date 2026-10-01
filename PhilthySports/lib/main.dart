@@ -235,6 +235,7 @@ class PredictionBundle {
   final String source;
   final String snapshotSha256;
   final bool fromBackend;
+  final String modelState;
   final List<PredictionRecord> records;
 
   const PredictionBundle({
@@ -242,6 +243,7 @@ class PredictionBundle {
     required this.source,
     required this.snapshotSha256,
     required this.fromBackend,
+    required this.modelState,
     required this.records,
   });
 }
@@ -543,11 +545,16 @@ class BackendClient {
         records.add(PredictionRecord(game, prediction));
       }
     }
+    final governance = _asMap(decoded['governance']);
     return PredictionBundle(
       sport: spec.key,
       source: (decoded['engine'] ?? 'PhilthySports backend').toString(),
       snapshotSha256: (decoded['snapshot_sha256'] ?? '').toString(),
       fromBackend: true,
+      modelState: (decoded['model_state'] ??
+              governance['model_state'] ??
+              'UNKNOWN')
+          .toString(),
       records: records,
     );
   }
@@ -614,9 +621,10 @@ class PredictionRepository {
 
     return PredictionBundle(
       sport: spec.key,
-      source: 'Direct ESPN + Philthy Baseline v1',
+      source: 'Direct ESPN + Philthy Baseline v1.1',
       snapshotSha256: snapshot.sha256Hex,
       fromBackend: false,
+      modelState: 'PROVISIONAL_SHADOW',
       records: records,
     );
   }
@@ -874,10 +882,10 @@ class _PicksPageState extends State<PicksPage> {
                 ? Icons.cloud_done
                 : Icons.smartphone,
             title: bundle?.fromBackend == true
-                ? 'Powerhouse backend mode'
-                : 'On-device baseline mode',
+                ? 'Governed backend mode'
+                : 'On-device shadow mode',
             subtitle:
-                '${bundle?.source ?? 'PhilthySports'}${hash.isNotEmpty ? ' · snapshot ${hash.substring(0, math.min(10, hash.length))}' : ''}',
+                '${bundle?.modelState ?? 'UNKNOWN'} · ${bundle?.source ?? 'PhilthySports'}${hash.isNotEmpty ? ' · snapshot ${hash.substring(0, math.min(10, hash.length))}' : ''}',
           ),
           const SizedBox(height: 10),
           if (records.isEmpty)
@@ -896,8 +904,8 @@ class _PicksPageState extends State<PicksPage> {
           const SizedBox(height: 8),
           const Text(
             'Model outputs are informational estimates, not guarantees. '
-            'The local baseline uses the verified BetP v3 record/strength logic recovered from the project files. '
-            'Configure a backend URL in Settings to replace it with your server-side Powerhouse pipeline.',
+            'The on-device engine is visibly PROVISIONAL_SHADOW and is not a promoted production model. '
+            'The backend keeps production at MARKET_BASELINE_ONLY until the v6 chronology, calibration, leakage, and credential gates pass.',
             style: TextStyle(fontSize: 12, color: Colors.white60),
           ),
         ],
@@ -1193,7 +1201,7 @@ class _SettingsPageState extends State<SettingsPage> {
         _systemStatus = results[1];
         _modelsStatus = results[2];
         _status =
-            'Connected: ${health['status'] ?? 'ok'} · engine ${health['engine'] ?? 'unknown'}';
+            'Connected: ${health['status'] ?? 'ok'} · engine ${health['engine'] ?? 'unknown'} · live gate ${health['live_gate'] ?? 'UNKNOWN'} · pass_for_live ${health['pass_for_live'] ?? false}';
       });
     } catch (e) {
       if (!mounted) return;
