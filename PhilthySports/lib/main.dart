@@ -607,9 +607,12 @@ class PredictionRepository {
     if (backendUrl.isNotEmpty) {
       try {
         return await BackendClient(backendUrl).fetchPredictions(spec);
-      } catch (_) {
-        // A configured backend is optional. Fall back to the local,
-        // keyless engine so the APK remains usable.
+      } catch (e) {
+        throw Exception(
+          'Configured backend failed. PhilthySports will not silently replace '
+          'it with the local shadow engine. Open Settings and choose '
+          '"Use local mode" to switch explicitly. Details: $e',
+        );
       }
     }
 
@@ -1308,7 +1311,7 @@ class _SettingsPageState extends State<SettingsPage> {
                 const SizedBox(height: 10),
                 if (_systemStatus == null) ...[
                   const Text(
-                    'Backend not connected. Local ESPN + MARKET_BASELINE_ONLY mode remains available.',
+                    'Backend not connected. Live ESPN scores and the on-device PROVISIONAL_SHADOW engine remain available.',
                     style: TextStyle(color: Colors.white70),
                   ),
                   const SizedBox(height: 8),
@@ -1376,7 +1379,7 @@ class _SettingsPageState extends State<SettingsPage> {
             child: Text(
               'Build: PhilthySports 1.2.0\n'
               'Protocol: v6 integration gates + tamper-evident ledger\n'
-              'Direct mode: ESPN scoreboard + MARKET_BASELINE_ONLY\n'
+              'Direct mode: ESPN scoreboard + PROVISIONAL_SHADOW\n'
               'Backend: /v1/system/status · /v1/models/status · /v1/predictions/latest\n'
               'Sports: NFL · NBA · MLB · NHL',
             ),
