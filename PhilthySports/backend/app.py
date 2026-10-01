@@ -7,6 +7,7 @@ import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 import requests
@@ -18,7 +19,7 @@ load_dotenv()
 
 app = FastAPI(
     title="PhilthySports API",
-    version="1.1.0",
+    version="1.2.0-v6-bridge",
     description="Unified NFL, NBA, MLB and NHL prediction bridge.",
 )
 
