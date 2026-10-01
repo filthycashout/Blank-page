@@ -1527,8 +1527,8 @@ class StatusPill extends StatelessWidget {
       padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
       decoration: BoxDecoration(
         borderRadius: BorderRadius.circular(99),
-        border: Border.all(color: color.withOpacity(0.6)),
-        color: color.withOpacity(0.10),
+        border: Border.all(color: color.withValues(alpha: 0.6)),
+        color: color.withValues(alpha: 0.10),
       ),
       child: Text(
         game.statusText.isEmpty ? game.statusName : game.statusText,
@@ -1706,9 +1706,9 @@ class InfoBanner extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
-        color: scheme.primaryContainer.withOpacity(0.35),
+        color: scheme.primaryContainer.withValues(alpha: 0.35),
         borderRadius: BorderRadius.circular(18),
-        border: Border.all(color: scheme.primary.withOpacity(0.25)),
+        border: Border.all(color: scheme.primary.withValues(alpha: 0.25)),
       ),
       child: Row(
         children: [
