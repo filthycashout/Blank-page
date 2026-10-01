@@ -63,3 +63,25 @@ Prediction output is informational and is not a guarantee of any sporting outcom
 - Added backend tracking metadata and /v1/parlays.
 - The visible XGBoost notebook path remains a Python/backend responsibility because its persisted artifact is a joblib model, not an Android-native model format.
 - The supplied ChatGPT share URL could not be fetched by this runtime, so no unsupported content from that link was invented.
+
+
+## 1.2 v6 protocol integration
+
+The APK now understands the visible v6 governance contract instead of treating all model paths as production-ready.
+
+Backend endpoints added:
+- GET /v1/system/status
+- GET /v1/models/status
+- GET /v1/predictions/latest
+- GET /v1/ledger/status
+
+Current production-safe state:
+- NFL: MARKET_BASELINE_ONLY
+- NBA: MARKET_BASELINE_ONLY
+- MLB: MARKET_BASELINE_ONLY
+- NHL: MARKET_BASELINE_ONLY
+- Private-provider execution is blocked until CREDENTIAL_ROTATION_CONFIRMED=true.
+- Prediction batches are written to an append-only SHA-256 hash chain. Deployment-level WORM/object-lock storage is still required for true storage immutability.
+- The APK Settings screen displays the backend credential-rotation and model-promotion gates when connected.
+
+The v6 summary supplied in chat describes walk-forward training, OOF calibration, CLV/settlement, live-odds freshness validation and measured parlay dependency. Their original implementation files were not supplied here, so this repository does not invent their missing algorithms or schemas. The integration boundary is ready for those verified modules when their actual source is available.
