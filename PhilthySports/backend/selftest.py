@@ -124,6 +124,15 @@ def main() -> None:
     assert market_prediction.total_confidence == 0.0
     assert 0 < market_prediction.home_win_probability < 1
 
+    started_payload = [{
+        **fresh_payload[0],
+        "id": "odds-started",
+        "commence_time": (now - timedelta(minutes=1)).isoformat(),
+    }]
+    accepted_started, quality_started = backend._validate_odds_payload(started_payload)
+    assert accepted_started == []
+    assert quality_started["rejected_started_events"] == 1
+
     stale_payload = [{
         **fresh_payload[0],
         "id": "odds-stale",
