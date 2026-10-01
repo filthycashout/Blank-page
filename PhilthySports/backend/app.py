@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import os
+import statistics
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -373,6 +374,154 @@ def _moneyline(probability: float) -> int:
     return round(100 * (1 - probability) / probability)
 
 
+def _american_implied_probability(price: Any) -> float | None:
+    try:
+        value = float(price)
+    except (TypeError, ValueError):
+        return None
+    if value == 0:
+        return None
+    if value < 0:
+        return abs(value) / (abs(value) + 100.0)
+    return 100.0 / (value + 100.0)
+
+
+def _fair_american_moneyline(probability: float) -> int:
+    probability = min(0.999, max(0.001, probability))
+    if probability >= 0.5:
+        return round(-100 * probability / (1 - probability))
+    return round(100 * (1 - probability) / probability)
+
+
+def _format_point(value: float) -> str:
+    return f"{value:+g}"
+
+
+def _team_code(name: str) -> str:
+    tokens = [token for token in name.replace("-", " ").split() if token]
+    if not tokens:
+        return "TEAM"
+    if len(tokens) == 1:
+        return tokens[0][:4].upper()
+    initials = "".join(token[0] for token in tokens)
+    return initials[:4].upper()
+
+
+def _market_baseline_prediction(
+    event: dict[str, Any],
+    sport_key: str,
+) -> tuple[dict[str, Any], Prediction] | None:
+    home = str(event.get("home_team") or "")
+    away = str(event.get("away_team") or "")
+    if not home or not away:
+        return None
+
+    fair_home_samples: list[float] = []
+    home_spreads: list[float] = []
+    away_spreads: list[float] = []
+    totals: list[float] = []
+
+    for book in event.get("bookmakers") or []:
+        if not isinstance(book, dict):
+            continue
+        for market in book.get("markets") or []:
+            if not isinstance(market, dict):
+                continue
+            key = str(market.get("key") or "")
+            outcomes = [
+                outcome
+                for outcome in (market.get("outcomes") or [])
+                if isinstance(outcome, dict)
+            ]
+
+            if key == "h2h":
+                by_name = {str(o.get("name") or ""): o for o in outcomes}
+                home_price = by_name.get(home, {}).get("price")
+                away_price = by_name.get(away, {}).get("price")
+                hp = _american_implied_probability(home_price)
+                ap = _american_implied_probability(away_price)
+                if hp is not None and ap is not None and (hp + ap) > 0:
+                    fair_home_samples.append(hp / (hp + ap))
+
+            elif key == "spreads":
+                by_name = {str(o.get("name") or ""): o for o in outcomes}
+                try:
+                    if home in by_name and by_name[home].get("point") is not None:
+                        home_spreads.append(float(by_name[home]["point"]))
+                    if away in by_name and by_name[away].get("point") is not None:
+                        away_spreads.append(float(by_name[away]["point"]))
+                except (TypeError, ValueError):
+                    pass
+
+            elif key == "totals":
+                for outcome in outcomes:
+                    if outcome.get("point") is None:
+                        continue
+                    try:
+                        totals.append(float(outcome["point"]))
+                    except (TypeError, ValueError):
+                        continue
+
+    if not fair_home_samples:
+        return None
+
+    home_probability = float(statistics.median(fair_home_samples))
+    pick = home if home_probability >= 0.53 else away if home_probability <= 0.47 else "PASS"
+    selected_probability = max(home_probability, 1 - home_probability)
+
+    if pick == "PASS":
+        fair_moneyline = 0
+    else:
+        fair_moneyline = _fair_american_moneyline(selected_probability)
+
+    home_spread = statistics.median(home_spreads) if home_spreads else None
+    away_spread = statistics.median(away_spreads) if away_spreads else None
+    if pick == home and home_spread is not None:
+        spread = f"{_team_code(home)} {_format_point(home_spread)}"
+    elif pick == away and away_spread is not None:
+        spread = f"{_team_code(away)} {_format_point(away_spread)}"
+    else:
+        spread = "MARKET N/A"
+
+    market_total = statistics.median(totals) if totals else None
+    total_lean = f"MARKET {market_total:g}" if market_total is not None else "MARKET N/A"
+    side = _team_code(home) if home_probability > 0.5 else _team_code(away)
+
+    game = {
+        "id": str(event.get("id") or ""),
+        "sport": sport_key.upper(),
+        "date": event.get("commence_time"),
+        "status_name": "STATUS_SCHEDULED",
+        "status_text": "Scheduled · fresh market",
+        "state": "pre",
+        "home_name": home,
+        "away_name": away,
+        "home_abbr": _team_code(home),
+        "away_abbr": _team_code(away),
+        "home_record": "",
+        "away_record": "",
+        "home_score": "",
+        "away_score": "",
+        "home_logo": "",
+        "away_logo": "",
+    }
+
+    prediction = Prediction(
+        home_win_probability=home_probability,
+        pick=pick if pick == "PASS" else _team_code(pick),
+        pick_confidence=selected_probability,
+        moneyline=fair_moneyline,
+        spread_lean=spread,
+        total_lean=total_lean,
+        total_confidence=0.0,
+        home_team_total="MARKET N/A",
+        away_team_total="MARKET N/A",
+        projected_outcome=f"{side} ML · MARKET_BASELINE",
+        engine="De-vigged market consensus baseline v1",
+    )
+    return game, prediction
+
+
 def predict_game(game: dict[str, Any]) -> Prediction:
     home_record = _record_strength(str(game.get("home_record") or ""))
     away_record = _record_strength(str(game.get("away_record") or ""))
@@ -467,7 +616,7 @@ def predict_game(game: dict[str, Any]) -> Prediction:
         home_team_total=home_team_total,
         away_team_total=away_team_total,
         projected_outcome=projected_outcome,
-        engine="Philthy Baseline v1.1 · BetP v3 deterministic port",
+        engine="Philthy Shadow v1.2 · BetP v3 deterministic port",
     )
 
 
@@ -598,76 +747,130 @@ def predictions(
     global _latest_run, _latest_verified_predictions
 
     sport_key = sport.lower()
-    data, snapshot = fetch_games(sport_key, days)
-    rows = []
     generated_at = datetime.now(timezone.utc).isoformat()
-    for game in data:
-        if not _strict_upcoming(game):
-            continue
+    gates = _system_gates()
 
-        prediction = predict_game(game).as_dict()
-        ledger_record = {
-            "recorded_at": generated_at,
-            "sport": sport_key.upper(),
-            "event_id": game.get("id"),
-            "event_time": game.get("date"),
-            "source_snapshot_sha256": snapshot,
-            "model_state": "PROVISIONAL_SHADOW",
-            "engine": prediction["engine"],
-            "game": game,
-            "prediction": prediction,
-        }
-        ledger_hash = _append_ledger(ledger_record)
-        rows.append(
-            {
+    if _production_live_enabled():
+        market_events, market_quality, quota = _fetch_live_odds(sport_key)
+        rows: list[dict[str, Any]] = []
+        snapshot = hashlib.sha256(
+            json.dumps(market_events, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+        for event in market_events:
+            built = _market_baseline_prediction(event, sport_key)
+            if built is None:
+                continue
+            game, prediction_obj = built
+            prediction = prediction_obj.as_dict()
+            ledger_record = {
+                "recorded_at": generated_at,
+                "sport": sport_key.upper(),
+                "event_id": game.get("id"),
+                "event_time": game.get("date"),
+                "source_snapshot_sha256": snapshot,
+                "model_state": "MARKET_BASELINE",
+                "engine": prediction["engine"],
+                "game": game,
+                "prediction": prediction,
+            }
+            ledger_hash = _append_ledger(ledger_record)
+            rows.append({
                 "game": game,
                 "prediction": prediction,
                 "ledger": {
                     "record_hash": ledger_hash,
                     "source_snapshot_sha256": snapshot,
                 },
-            }
-        )
+            })
 
-    gates = _system_gates()
-    payload = {
-        "sport": sport_key.upper(),
-        "generated_at": generated_at,
-        "engine": "Philthy Baseline v1.1 · BetP v3 deterministic port",
-        "model_state": "PROVISIONAL_SHADOW",
-        "snapshot_sha256": snapshot,
-        "predictions": rows,
-        "tracking": {
-            "games_predicted": len(rows),
-            "filter": "strict upcoming only",
-            "spread_used": "exactly 2.5",
-            "parlay_sizes": [7, 10, 14],
-            "bankroll_usd": 3.0,
+        payload = {
+            "sport": sport_key.upper(),
             "generated_at": generated_at,
-        },
-        "governance": {
-            "mode": "shadow",
+            "engine": "De-vigged market consensus baseline v1",
+            "model_state": "MARKET_BASELINE",
+            "snapshot_sha256": snapshot,
+            "predictions": rows,
+            "tracking": {
+                "games_predicted": len(rows),
+                "source": "The Odds API",
+                "quality": market_quality,
+                "quota": quota,
+                "generated_at": generated_at,
+            },
+            "governance": {
+                "mode": "production_baseline",
+                "model_state": "MARKET_BASELINE",
+                "production_policy": "MARKET_BASELINE_ONLY",
+                "promotion_blocker": "AWAITING_CANONICAL_HISTORY",
+                "credential_gate": gates["credential_rotation"],
+                "pass_for_live": gates["pass_for_live"],
+                "private_provider_keys_embedded_in_apk": False,
+            },
+        }
+        _latest_verified_predictions = rows
+    else:
+        data, snapshot = fetch_games(sport_key, days)
+        rows = []
+        for game in data:
+            if not _strict_upcoming(game):
+                continue
+            prediction = predict_game(game).as_dict()
+            ledger_record = {
+                "recorded_at": generated_at,
+                "sport": sport_key.upper(),
+                "event_id": game.get("id"),
+                "event_time": game.get("date"),
+                "source_snapshot_sha256": snapshot,
+                "model_state": "PROVISIONAL_SHADOW",
+                "engine": prediction["engine"],
+                "game": game,
+                "prediction": prediction,
+            }
+            ledger_hash = _append_ledger(ledger_record)
+            rows.append({
+                "game": game,
+                "prediction": prediction,
+                "ledger": {
+                    "record_hash": ledger_hash,
+                    "source_snapshot_sha256": snapshot,
+                },
+            })
+
+        payload = {
+            "sport": sport_key.upper(),
+            "generated_at": generated_at,
+            "engine": "Philthy Shadow v1.2 · BetP v3 deterministic port",
             "model_state": "PROVISIONAL_SHADOW",
-            "production_policy": "MARKET_BASELINE_ONLY",
-            "promotion_blocker": "AWAITING_CANONICAL_HISTORY",
-            "credential_gate": gates["credential_rotation"],
-            "pass_for_live": gates["pass_for_live"],
-            "private_provider_keys_embedded_in_apk": False,
-        },
-    }
+            "snapshot_sha256": snapshot,
+            "predictions": rows,
+            "tracking": {
+                "games_predicted": len(rows),
+                "filter": "strict upcoming only",
+                "spread_used": "exactly 2.5",
+                "parlay_sizes": [7, 10, 14],
+                "bankroll_usd": 3.0,
+                "generated_at": generated_at,
+            },
+            "governance": {
+                "mode": "shadow",
+                "model_state": "PROVISIONAL_SHADOW",
+                "production_policy": "MARKET_BASELINE_ONLY",
+                "promotion_blocker": "AWAITING_CANONICAL_HISTORY",
+                "credential_gate": gates["credential_rotation"],
+                "pass_for_live": gates["pass_for_live"],
+                "private_provider_keys_embedded_in_apk": False,
+            },
+        }
 
     _latest_run = {
         "sport": sport_key.upper(),
         "generated_at": generated_at,
-        "games_predicted": len(rows),
-        "snapshot_sha256": snapshot,
-        "model_state": "PROVISIONAL_SHADOW",
+        "games_predicted": len(payload["predictions"]),
+        "snapshot_sha256": payload["snapshot_sha256"],
+        "model_state": payload["model_state"],
         "pass_for_live": gates["pass_for_live"],
     }
-
-    if _production_live_enabled():
-        _latest_verified_predictions = rows
-
     return payload
 
 
@@ -821,12 +1024,11 @@ def _validate_odds_payload(payload: Any) -> tuple[list[dict[str, Any]], dict[str
     }
 
 
-@app.get("/v1/odds/{sport}")
-def odds(sport: str) -> dict[str, Any]:
-    sport_key = sport.lower()
+def _fetch_live_odds(
+    sport_key: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
     if sport_key not in SPORTS:
         raise HTTPException(status_code=404, detail="Unsupported sport")
-
     if not _rotation_confirmed():
         raise HTTPException(
             status_code=503,
@@ -852,18 +1054,12 @@ def odds(sport: str) -> dict[str, Any]:
         response = requests.get(url, params=params, timeout=18)
         response.raise_for_status()
         events, quality = _validate_odds_payload(response.json())
-        return {
-            "sport": sport_key.upper(),
-            "provider": "The Odds API",
-            "fetched_at": datetime.now(timezone.utc).isoformat(),
-            "quality": quality,
-            "quota": {
-                "requests_remaining": response.headers.get("x-requests-remaining"),
-                "requests_used": response.headers.get("x-requests-used"),
-                "requests_last": response.headers.get("x-requests-last"),
-            },
-            "events": events,
+        quota = {
+            "requests_remaining": response.headers.get("x-requests-remaining"),
+            "requests_used": response.headers.get("x-requests-used"),
+            "requests_last": response.headers.get("x-requests-last"),
         }
+        return events, quality, quota
     except HTTPException:
         raise
     except requests.RequestException as exc:
@@ -877,3 +1073,17 @@ def odds(sport: str) -> dict[str, Any]:
             status_code=502,
             detail="Odds provider returned malformed JSON.",
         ) from exc
+
+
+@app.get("/v1/odds/{sport}")
+def odds(sport: str) -> dict[str, Any]:
+    sport_key = sport.lower()
+    events, quality, quota = _fetch_live_odds(sport_key)
+    return {
+        "sport": sport_key.upper(),
+        "provider": "The Odds API",
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "quality": quality,
+        "quota": quota,
+        "events": events,
+    }
