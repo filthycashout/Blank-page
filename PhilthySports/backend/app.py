@@ -74,11 +74,7 @@ KNOWN_MLB_STRENGTH = {
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "300"))
 ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports"
 ODDS_BASE = "https://api.the-odds-api.com/v4"
-LEDGER_PATH = os.getenv(
-    "PREDICTION_LEDGER_PATH",
-    "/tmp/philthysports_prediction_ledger.jsonl",
-)
-
+ODDS_MAX_AGE_MINUTES = int(os.getenv("ODDS_MAX_AGE_MINUTES", "15"))
 MASTER_PROTOCOL = [
     "Understand",
     "Decompose",
@@ -199,93 +195,6 @@ def _append_ledger(record: dict[str, Any]) -> str:
     with LEDGER_PATH.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(body, sort_keys=True) + "\n")
     return record_hash
-
-
-def _env_true(name: str) -> bool:
-    return str(os.getenv(name, "")).strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "y",
-        "on",
-        "confirmed",
-    }
-
-
-def _provider_status() -> dict[str, bool]:
-    return {
-        "odds_api_configured": bool(os.getenv("ODDS_API_KEY")),
-        "sportradar_configured": bool(os.getenv("SPORTRADAR_API_KEY")),
-        "visual_crossing_configured": bool(os.getenv("VISUAL_CROSSING_API_KEY")),
-        "google_sheets_configured": bool(os.getenv("GOOGLE_SHEETS_ID")),
-        "google_cloud_configured": bool(os.getenv("GCLOUD_PROJECT_ID")),
-    }
-
-
-def _model_gate_status() -> dict[str, dict[str, Any]]:
-    reason = (
-        "No verified promoted game-winner model artifact with qualifying "
-        "timestamped pregame evidence is bundled for this sport in this build."
-    )
-    return {
-        sport.upper(): {
-            "mode": "MARKET_BASELINE_ONLY",
-            "promoted": False,
-            "shadow_eligible": False,
-            "reason": reason,
-        }
-        for sport in SPORTS
-    }
-
-
-def _ledger_append(event_type: str, payload: dict[str, Any]) -> str:
-    """Append a tamper-evident hash-chained ledger record.
-
-    This is append-only at the application layer. Filesystem/object-store
-    immutability must be supplied by the deployment platform if required.
-    """
-    directory = os.path.dirname(LEDGER_PATH)
-    if directory:
-        os.makedirs(directory, exist_ok=True)
-
-    previous_hash = ""
-    if os.path.exists(LEDGER_PATH):
-        try:
-            with open(LEDGER_PATH, "r", encoding="utf-8") as handle:
-                for line in handle:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        previous_hash = str(json.loads(line).get("record_hash") or "")
-                    except json.JSONDecodeError:
-                        continue
-        except OSError:
-            previous_hash = ""
-
-    unsigned = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "event_type": event_type,
-        "previous_hash": previous_hash,
-        "payload": payload,
-    }
-    canonical = json.dumps(
-        unsigned,
-        sort_keys=True,
-        separators=(",", ":"),
-        default=str,
-    )
-    record_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    record = {**unsigned, "record_hash": record_hash}
-
-    try:
-        with open(LEDGER_PATH, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, sort_keys=True, default=str) + "\n")
-    except OSError:
-        return ""
-
-    return record_hash
-
 
 
 @dataclass(frozen=True)
@@ -609,6 +518,15 @@ def system_status() -> dict[str, Any]:
     }
 
 
+@app.get("/v1/protocol")
+def protocol() -> dict[str, Any]:
+    return {
+        "master_protocol": MASTER_PROTOCOL,
+        "experiment_loop": EXPERIMENT_LOOP,
+        "operating_sequence": OPERATING_SEQUENCE,
+    }
+
+
 @app.get("/v1/models/status")
 def models_status() -> dict[str, Any]:
     sports = {}
@@ -826,6 +744,83 @@ def parlays(days: int = Query(2, ge=1, le=7)) -> dict[str, Any]:
     }
 
 
+def _parse_provider_time(value: Any) -> datetime | None:
+    if not value:
+        return None
+    text = str(value).strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _validate_odds_payload(payload: Any) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if not isinstance(payload, list):
+        raise HTTPException(status_code=502, detail="Odds provider returned an invalid schema.")
+
+    now = datetime.now(timezone.utc)
+    accepted: list[dict[str, Any]] = []
+    rejected_schema = 0
+    rejected_stale = 0
+    fresh_bookmakers = 0
+    stale_bookmakers = 0
+
+    for raw in payload:
+        if not isinstance(raw, dict):
+            rejected_schema += 1
+            continue
+
+        if not all(raw.get(key) for key in ("id", "home_team", "away_team", "commence_time")):
+            rejected_schema += 1
+            continue
+
+        bookmakers = raw.get("bookmakers")
+        if not isinstance(bookmakers, list) or not bookmakers:
+            rejected_stale += 1
+            continue
+
+        fresh: list[dict[str, Any]] = []
+        for book in bookmakers:
+            if not isinstance(book, dict):
+                continue
+            updated = _parse_provider_time(book.get("last_update"))
+            if updated is None:
+                stale_bookmakers += 1
+                continue
+            age_minutes = max(0.0, (now - updated).total_seconds() / 60.0)
+            if age_minutes <= ODDS_MAX_AGE_MINUTES:
+                item = dict(book)
+                item["age_minutes"] = round(age_minutes, 2)
+                fresh.append(item)
+                fresh_bookmakers += 1
+            else:
+                stale_bookmakers += 1
+
+        if not fresh:
+            rejected_stale += 1
+            continue
+
+        event = dict(raw)
+        event["bookmakers"] = fresh
+        event["data_quality"] = "FRESH"
+        accepted.append(event)
+
+    return accepted, {
+        "schema_valid": rejected_schema == 0,
+        "accepted_events": len(accepted),
+        "rejected_schema_events": rejected_schema,
+        "rejected_stale_events": rejected_stale,
+        "fresh_bookmakers": fresh_bookmakers,
+        "stale_bookmakers": stale_bookmakers,
+        "max_bookmaker_age_minutes": ODDS_MAX_AGE_MINUTES,
+    }
+
+
 @app.get("/v1/odds/{sport}")
 def odds(sport: str) -> dict[str, Any]:
     sport_key = sport.lower()
@@ -846,17 +841,39 @@ def odds(sport: str) -> dict[str, Any]:
         )
 
     _, _, odds_sport = SPORTS[sport_key]
-    url = (
-        f"{ODDS_BASE}/sports/{odds_sport}/odds/"
-        f"?apiKey={key}&regions=us&markets=h2h,spreads,totals&oddsFormat=american"
-    )
+    url = f"{ODDS_BASE}/sports/{odds_sport}/odds/"
+    params = {
+        "apiKey": key,
+        "regions": "us",
+        "markets": "h2h,spreads,totals",
+        "oddsFormat": "american",
+    }
     try:
-        response = requests.get(url, timeout=18)
+        response = requests.get(url, params=params, timeout=18)
         response.raise_for_status()
+        events, quality = _validate_odds_payload(response.json())
         return {
             "sport": sport_key.upper(),
             "provider": "The Odds API",
-            "events": response.json(),
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "quality": quality,
+            "quota": {
+                "requests_remaining": response.headers.get("x-requests-remaining"),
+                "requests_used": response.headers.get("x-requests-used"),
+                "requests_last": response.headers.get("x-requests-last"),
+            },
+            "events": events,
         }
+    except HTTPException:
+        raise
     except requests.RequestException as exc:
-        raise HTTPException(status_code=502, detail=f"Odds fetch failed: {exc}") from exc
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Odds provider request failed (status={status or 'network'}).",
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Odds provider returned malformed JSON.",
+        ) from exc
