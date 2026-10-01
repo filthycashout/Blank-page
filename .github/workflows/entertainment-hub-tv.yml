@@ -30,10 +30,15 @@ jobs:
         with:
           gradle-version: '8.10.2'
 
-      - name: Extract Entertainment Hub TV
+      - name: Reconstruct and extract Entertainment Hub TV
+        shell: bash
         run: |
-          rm -rf extracted
-          unzip -q EntertainmentHubTV.zip -d extracted
+          rm -rf extracted EntertainmentHubTV.rebuilt.zip
+          for part in buildparts/EntertainmentHubTV.b64.part-*; do
+            base64 -d "$part"
+          done > EntertainmentHubTV.rebuilt.zip
+          unzip -t EntertainmentHubTV.rebuilt.zip
+          unzip -q EntertainmentHubTV.rebuilt.zip -d extracted
 
       - name: Build debug APK
         working-directory: extracted/EntertainmentHubTV
