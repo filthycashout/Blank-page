@@ -122,6 +122,83 @@ OPERATING_SEQUENCE = [
 
 _cache: dict[str, tuple[float, Any, str]] = {}
 
+RUNTIME_DIR = Path(os.getenv("PHILTHY_RUNTIME_DIR", "/tmp/philthysports"))
+RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+LEDGER_PATH = RUNTIME_DIR / "prediction_ledger.jsonl"
+
+_latest_run: dict[str, Any] | None = None
+_latest_verified_predictions: list[dict[str, Any]] = []
+
+
+def _truthy_env(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _rotation_confirmed() -> bool:
+    return _truthy_env("CREDENTIAL_ROTATION_CONFIRMED")
+
+
+def _production_live_enabled() -> bool:
+    return _rotation_confirmed() and _truthy_env("PHILTHY_LIVE_ENABLED")
+
+
+def _provider_state() -> dict[str, bool]:
+    return {
+        "odds_api_configured": bool(os.getenv("ODDS_API_KEY")),
+        "sportradar_configured": bool(os.getenv("SPORTRADAR_API_KEY")),
+        "visual_crossing_configured": bool(os.getenv("VISUAL_CROSSING_API_KEY")),
+        "google_sheets_configured": bool(os.getenv("GOOGLE_SHEETS_ID")),
+        "google_cloud_configured": bool(os.getenv("GCLOUD_PROJECT_ID")),
+    }
+
+
+def _system_gates() -> dict[str, Any]:
+    providers = _provider_state()
+    rotation = _rotation_confirmed()
+    return {
+        "credential_rotation": "PASS" if rotation else "BLOCKED_EXTERNAL_ROTATION",
+        "canonical_history": "AWAITING_CANONICAL_HISTORY",
+        "live_data_qa": (
+            "READY_FOR_PREFLIGHT"
+            if rotation and providers["odds_api_configured"]
+            else "BLOCKED_MISSING_ROTATED_CREDENTIAL"
+        ),
+        "model_policy": "MARKET_BASELINE_ONLY",
+        "parlay_dependency": "INDEPENDENCE_FALLBACK",
+        "settlement": "READY_WITH_DATA",
+        "closing_line_clv": "READY_WITH_DATA",
+        "pass_for_live": bool(
+            rotation
+            and providers["odds_api_configured"]
+            and _truthy_env("PHILTHY_LIVE_ENABLED")
+        ),
+    }
+
+
+def _last_ledger_hash() -> str:
+    if not LEDGER_PATH.exists():
+        return ""
+    try:
+        lines = LEDGER_PATH.read_text(encoding="utf-8").splitlines()
+        if not lines:
+            return ""
+        last = json.loads(lines[-1])
+        return str(last.get("record_hash") or "")
+    except Exception:
+        return ""
+
+
+def _append_ledger(record: dict[str, Any]) -> str:
+    prev_hash = _last_ledger_hash()
+    body = dict(record)
+    body["prev_hash"] = prev_hash
+    canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
+    record_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    body["record_hash"] = record_hash
+    with LEDGER_PATH.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(body, sort_keys=True) + "\n")
+    return record_hash
+
 
 def _env_true(name: str) -> bool:
     return str(os.getenv(name, "")).strip().lower() in {
@@ -505,89 +582,78 @@ def _strict_upcoming(game: dict[str, Any]) -> bool:
 
 @app.get("/health")
 def health() -> dict[str, Any]:
+    gates = _system_gates()
     return {
         "status": "ok",
         "service": "PhilthySports",
-        "version": "1.2.0",
-        "protocol_version": "v6 integration",
-        "engine": os.getenv("PHILTHY_ENGINE_MODE", "market_baseline_only"),
-        "providers": _provider_status(),
-        "gates": {
-            "credential_rotation_confirmed": _env_true(
-                "CREDENTIAL_ROTATION_CONFIRMED"
-            ),
-            "all_four_sports_promoted": False,
-        },
+        "version": "1.2.0-v6-bridge",
+        "engine": os.getenv("PHILTHY_ENGINE_MODE", "provisional_shadow"),
+        "live_gate": gates["credential_rotation"],
+        "pass_for_live": gates["pass_for_live"],
+        "providers": _provider_state(),
     }
 
 
 @app.get("/v1/system/status")
 def system_status() -> dict[str, Any]:
-    rotation_confirmed = _env_true("CREDENTIAL_ROTATION_CONFIRMED")
     return {
         "service": "PhilthySports",
-        "version": "1.2.0",
-        "protocol_version": "v6 integration",
-        "master_protocol": MASTER_PROTOCOL,
-        "experiment_loop": EXPERIMENT_LOOP,
-        "operating_sequence": OPERATING_SEQUENCE,
-        "security": {
-            "credential_rotation_confirmed": rotation_confirmed,
-            "private_provider_execution": (
-                "ENABLED" if rotation_confirmed else "BLOCKED_PENDING_ROTATION"
-            ),
-            "apk_embeds_private_provider_keys": False,
-        },
-        "execution": {
-            "keyless_espn_baseline": "AVAILABLE",
-            "market_baseline_mode": "AVAILABLE",
-            "promoted_four_sport_models": "NOT_AVAILABLE",
-        },
-        "providers": _provider_status(),
-        "remaining_gates": [
-            "Confirm provider credential rotation before private-provider live execution.",
-            "Supply and pass qualifying timestamped pregame training evidence before promoting game-winner models.",
-        ],
+        "version": "1.2.0-v6-bridge",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "gates": _system_gates(),
+        "release_state": (
+            "LIVE_ENABLED" if _production_live_enabled() else "SHADOW_BASELINE_ONLY"
+        ),
+        "principle": "fail_closed_on_unverified_external_prerequisites",
     }
 
 
 @app.get("/v1/models/status")
 def models_status() -> dict[str, Any]:
+    sports = {}
+    for sport in SPORTS:
+        sports[sport.upper()] = {
+            "production_state": "MARKET_BASELINE_ONLY",
+            "candidate_state": "CANDIDATE_SHADOW",
+            "promotion_blocker": "AWAITING_CANONICAL_HISTORY",
+            "minimum_canonical_rows": 200,
+            "promotion_requires": [
+                "chronological_holdout",
+                "brier_improvement",
+                "non_inferior_log_loss",
+                "acceptable_ece",
+                "no_leakage_blocker",
+                "artifact_and_dataset_hashes",
+            ],
+        }
     return {
-        "promotion_policy": {
-            "default_mode": "MARKET_BASELINE_ONLY",
-            "no_synthetic_history": True,
-            "pregame_timestamp_required": True,
-            "mismatched_model_artifacts_rejected": True,
-        },
-        "sports": _model_gate_status(),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "sports": sports,
     }
 
 
-@app.get("/v1/ledger/status")
-def ledger_status() -> dict[str, Any]:
-    records = 0
-    last_hash = ""
-    if os.path.exists(LEDGER_PATH):
-        try:
-            with open(LEDGER_PATH, "r", encoding="utf-8") as handle:
-                for line in handle:
-                    if not line.strip():
-                        continue
-                    records += 1
-                    try:
-                        last_hash = str(json.loads(line).get("record_hash") or last_hash)
-                    except json.JSONDecodeError:
-                        pass
-        except OSError:
-            pass
-
+@app.get("/v1/predictions/latest")
+def predictions_latest() -> dict[str, Any]:
     return {
-        "path": LEDGER_PATH,
-        "records": records,
-        "last_record_hash": last_hash,
-        "mode": "append_only_hash_chain",
-        "storage_immutability": "deployment_dependent",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "verified_live_run": _production_live_enabled(),
+        "predictions": list(_latest_verified_predictions)
+        if _production_live_enabled()
+        else [],
+        "note": (
+            "Latest verified live predictions"
+            if _production_live_enabled()
+            else "Empty by design until live security/data gates are explicitly enabled."
+        ),
+    }
+
+
+@app.get("/v1/runs/latest")
+def runs_latest() -> dict[str, Any]:
+    return {
+        "latest_run": _latest_run,
+        "ledger_path": str(LEDGER_PATH),
+        "ledger_mode": "append_only_hash_chained_runtime_log",
     }
 
 
@@ -610,23 +676,46 @@ def predictions(
     sport: str,
     days: int = Query(2, ge=1, le=7),
 ) -> dict[str, Any]:
+    global _latest_run, _latest_verified_predictions
+
     sport_key = sport.lower()
     data, snapshot = fetch_games(sport_key, days)
     rows = []
+    generated_at = datetime.now(timezone.utc).isoformat()
     for game in data:
         if not _strict_upcoming(game):
             continue
+
+        prediction = predict_game(game).as_dict()
+        ledger_record = {
+            "recorded_at": generated_at,
+            "sport": sport_key.upper(),
+            "event_id": game.get("id"),
+            "event_time": game.get("date"),
+            "source_snapshot_sha256": snapshot,
+            "model_state": "PROVISIONAL_SHADOW",
+            "engine": prediction["engine"],
+            "game": game,
+            "prediction": prediction,
+        }
+        ledger_hash = _append_ledger(ledger_record)
         rows.append(
             {
                 "game": game,
-                "prediction": predict_game(game).as_dict(),
+                "prediction": prediction,
+                "ledger": {
+                    "record_hash": ledger_hash,
+                    "source_snapshot_sha256": snapshot,
+                },
             }
         )
 
-    response_payload = {
+    gates = _system_gates()
+    payload = {
         "sport": sport_key.upper(),
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": generated_at,
         "engine": "Philthy Baseline v1.1 · BetP v3 deterministic port",
+        "model_state": "PROVISIONAL_SHADOW",
         "snapshot_sha256": snapshot,
         "predictions": rows,
         "tracking": {
@@ -635,66 +724,32 @@ def predictions(
             "spread_used": "exactly 2.5",
             "parlay_sizes": [7, 10, 14],
             "bankroll_usd": 3.0,
-            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "generated_at": generated_at,
         },
         "governance": {
-            "mode": "MARKET_BASELINE_ONLY",
-            "model_promoted": False,
-            "powerhouse_bridge": "ready_for_verified_model_artifacts",
+            "mode": "shadow",
+            "model_state": "PROVISIONAL_SHADOW",
+            "production_policy": "MARKET_BASELINE_ONLY",
+            "promotion_blocker": "AWAITING_CANONICAL_HISTORY",
+            "credential_gate": gates["credential_rotation"],
+            "pass_for_live": gates["pass_for_live"],
             "private_provider_keys_embedded_in_apk": False,
         },
     }
-    ledger_hash = _ledger_append(
-        "prediction_batch",
-        {
-            "sport": sport_key.upper(),
-            "snapshot_sha256": snapshot,
-            "games_predicted": len(rows),
-            "engine": response_payload["engine"],
-            "governance_mode": response_payload["governance"]["mode"],
-        },
-    )
-    response_payload["ledger_record_hash"] = ledger_hash
-    return response_payload
 
-
-@app.get("/v1/predictions/latest")
-def latest_predictions(days: int = Query(2, ge=1, le=7)) -> dict[str, Any]:
-    rows: list[dict[str, Any]] = []
-    snapshots: list[str] = []
-
-    for sport_key in SPORTS:
-        games, snapshot = fetch_games(sport_key, days)
-        snapshots.append(snapshot)
-        for game in games:
-            if not _strict_upcoming(game):
-                continue
-            rows.append({
-                "game": game,
-                "prediction": predict_game(game).as_dict(),
-                "governance_mode": "MARKET_BASELINE_ONLY",
-            })
-
-    rows.sort(key=lambda item: str(item["game"].get("date") or ""))
-    combined_snapshot = hashlib.sha256(
-        "".join(snapshots).encode("utf-8")
-    ).hexdigest()
-    ledger_hash = _ledger_append(
-        "latest_predictions",
-        {
-            "snapshot_sha256": combined_snapshot,
-            "predictions": len(rows),
-            "sports": sorted({item["game"]["sport"] for item in rows}),
-        },
-    )
-
-    return {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "snapshot_sha256": combined_snapshot,
-        "governance_mode": "MARKET_BASELINE_ONLY",
-        "ledger_record_hash": ledger_hash,
-        "predictions": rows,
+    _latest_run = {
+        "sport": sport_key.upper(),
+        "generated_at": generated_at,
+        "games_predicted": len(rows),
+        "snapshot_sha256": snapshot,
+        "model_state": "PROVISIONAL_SHADOW",
+        "pass_for_live": gates["pass_for_live"],
     }
+
+    if _production_live_enabled():
+        _latest_verified_predictions = rows
+
+    return payload
 
 
 @app.get("/v1/parlays")
@@ -775,6 +830,12 @@ def odds(sport: str) -> dict[str, Any]:
     sport_key = sport.lower()
     if sport_key not in SPORTS:
         raise HTTPException(status_code=404, detail="Unsupported sport")
+
+    if not _rotation_confirmed():
+        raise HTTPException(
+            status_code=503,
+            detail="Live odds blocked until provider credential rotation is confirmed.",
+        )
 
     key = os.getenv("ODDS_API_KEY")
     if not key:
