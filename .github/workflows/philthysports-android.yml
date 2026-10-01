@@ -72,7 +72,22 @@ jobs:
           cache: true
 
       - name: Validate backend source
-        run: python -m py_compile PhilthySports/backend/app.py
+        run: |
+          python -m py_compile PhilthySports/backend/app.py
+          python -m py_compile PhilthySports/backend/selftest.py
+          python -m py_compile PhilthySports/backend/secret_scan.py
+
+      - name: Install backend test dependencies
+        run: python -m pip install -r PhilthySports/backend/requirements.txt
+
+      - name: Secret scan
+        run: python PhilthySports/backend/secret_scan.py
+
+      - name: Backend v6 contract selftest
+        env:
+          CREDENTIAL_ROTATION_CONFIRMED: "false"
+          PHILTHY_LIVE_ENABLED: "false"
+        run: python PhilthySports/backend/selftest.py
 
       - name: Generate Android wrapper and copy PhilthySports source
         shell: bash
