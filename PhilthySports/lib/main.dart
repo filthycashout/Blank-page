@@ -1387,7 +1387,7 @@ class _SettingsPageState extends State<SettingsPage> {
           child: Padding(
             padding: EdgeInsets.all(16),
             child: Text(
-              'Build: PhilthySports 1.2.0\n'
+              'Build: PhilthySports 1.2.1\n'
               'Protocol: v6 integration gates + tamper-evident ledger\n'
               'Direct mode: ESPN scoreboard + PROVISIONAL_SHADOW\n'
               'Backend: /v1/system/status · /v1/models/status · /v1/predictions/latest\n'
@@ -2697,7 +2697,7 @@ class _SettingsPageState extends State<SettingsPage> {
           child: Padding(
             padding: EdgeInsets.all(16),
             child: Text(
-              'Build: PhilthySports 1.2.0\n'
+              'Build: PhilthySports 1.2.1\n'
               'Protocol: v6 integration gates + tamper-evident ledger\n'
               'Direct mode: ESPN scoreboard + PROVISIONAL_SHADOW\n'
               'Backend: /v1/system/status · /v1/models/status · /v1/predictions/latest\n'
