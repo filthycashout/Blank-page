@@ -563,6 +563,30 @@ class BackendClient {
     if (decoded is Map<String, dynamic>) return decoded;
     throw Exception('Invalid health response');
   }
+
+  Future<Map<String, dynamic>> systemStatus() async {
+    final response = await http
+        .get(Uri.parse('$_root/v1/system/status'))
+        .timeout(const Duration(seconds: 12));
+    if (response.statusCode != 200) {
+      throw Exception('HTTP ${response.statusCode}');
+    }
+    final decoded = jsonDecode(response.body);
+    if (decoded is Map<String, dynamic>) return decoded;
+    throw Exception('Invalid system status response');
+  }
+
+  Future<Map<String, dynamic>> modelsStatus() async {
+    final response = await http
+        .get(Uri.parse('$_root/v1/models/status'))
+        .timeout(const Duration(seconds: 12));
+    if (response.statusCode != 200) {
+      throw Exception('HTTP ${response.statusCode}');
+    }
+    final decoded = jsonDecode(response.body);
+    if (decoded is Map<String, dynamic>) return decoded;
+    throw Exception('Invalid model status response');
+  }
 }
 
 class PredictionRepository {
@@ -1123,6 +1147,8 @@ class _SettingsPageState extends State<SettingsPage> {
   bool _loaded = false;
   bool _testing = false;
   String? _status;
+  Map<String, dynamic>? _systemStatus;
+  Map<String, dynamic>? _modelsStatus;
 
   @override
   void initState() {
@@ -1155,9 +1181,17 @@ class _SettingsPageState extends State<SettingsPage> {
       _status = null;
     });
     try {
-      final health = await BackendClient(value).health();
+      final client = BackendClient(value);
+      final results = await Future.wait<Map<String, dynamic>>([
+        client.health(),
+        client.systemStatus(),
+        client.modelsStatus(),
+      ]);
+      final health = results[0];
       if (!mounted) return;
       setState(() {
+        _systemStatus = results[1];
+        _modelsStatus = results[2];
         _status =
             'Connected: ${health['status'] ?? 'ok'} · engine ${health['engine'] ?? 'unknown'}';
       });
@@ -1253,6 +1287,54 @@ class _SettingsPageState extends State<SettingsPage> {
           ),
         ),
         const SizedBox(height: 12),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'v6 production gates',
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800),
+                ),
+                const SizedBox(height: 10),
+                if (_systemStatus == null) ...[
+                  const Text(
+                    'Backend not connected. Local ESPN + MARKET_BASELINE_ONLY mode remains available.',
+                    style: TextStyle(color: Colors.white70),
+                  ),
+                  const SizedBox(height: 8),
+                  const Text(
+                    'Connect the Python backend above to read credential-rotation and model-promotion gates.',
+                    style: TextStyle(color: Colors.white54),
+                  ),
+                ] else ...[
+                  Text(
+                    'Credential rotation: ${_asMap(_asMap(_systemStatus!['security']))['credential_rotation_confirmed'] == true ? 'CONFIRMED' : 'PENDING'}',
+                  ),
+                  Text(
+                    'Private-provider execution: ${_asMap(_asMap(_systemStatus!['security']))['private_provider_execution'] ?? 'UNKNOWN'}',
+                  ),
+                  const SizedBox(height: 8),
+                  ...sportSpecs.map((sport) {
+                    final sports = _asMap(_modelsStatus?['sports']);
+                    final row = _asMap(sports[sport.key]);
+                    return Text(
+                      '${sport.key}: ${row['mode'] ?? 'MARKET_BASELINE_ONLY'}',
+                    );
+                  }),
+                ],
+                const SizedBox(height: 10),
+                const Text(
+                  'Promotion stays blocked until qualifying timestamped pregame evidence and the production gates pass. '
+                  'The APK does not turn missing prerequisites into a green status.',
+                  style: TextStyle(color: Colors.white60),
+                ),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 12),
         const Card(
           child: Padding(
             padding: EdgeInsets.all(16),
@@ -1284,9 +1366,10 @@ class _SettingsPageState extends State<SettingsPage> {
           child: Padding(
             padding: EdgeInsets.all(16),
             child: Text(
-              'Build: PhilthySports 1.1.0\n'
-              'Direct mode: ESPN scoreboard + BetP v3-derived baseline\n'
-              'Backend mode: /v1/predictions/{sport}\n'
+              'Build: PhilthySports 1.2.0\n'
+              'Protocol: v6 integration gates + tamper-evident ledger\n'
+              'Direct mode: ESPN scoreboard + MARKET_BASELINE_ONLY\n'
+              'Backend: /v1/system/status · /v1/models/status · /v1/predictions/latest\n'
               'Sports: NFL · NBA · MLB · NHL',
             ),
           ),
