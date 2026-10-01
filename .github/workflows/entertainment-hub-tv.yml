@@ -49,9 +49,15 @@ jobs:
         run: gradle :app:assembleDebug --stacktrace
 
       - name: Verify APK
+        shell: bash
         run: |
-          test -s extracted/EntertainmentHubTV/app/build/outputs/apk/debug/app-debug.apk
-          ls -lh extracted/EntertainmentHubTV/app/build/outputs/apk/debug/app-debug.apk
+          APK="extracted/EntertainmentHubTV/app/build/outputs/apk/debug/app-debug.apk"
+          test -s "$APK"
+          unzip -t "$APK" >/dev/null
+          APKSIGNER="$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -n 1)"
+          test -x "$APKSIGNER"
+          "$APKSIGNER" verify --verbose --print-certs "$APK"
+          ls -lh "$APK"
 
       - uses: actions/upload-artifact@v4
         with:
