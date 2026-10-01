@@ -17,7 +17,7 @@ load_dotenv()
 
 app = FastAPI(
     title="PhilthySports API",
-    version="1.0.0",
+    version="1.1.0",
     description="Unified NFL, NBA, MLB and NHL prediction bridge.",
 )
 
@@ -85,6 +85,9 @@ class Prediction:
     spread_lean: str
     total_lean: str
     total_confidence: float
+    home_team_total: str
+    away_team_total: str
+    projected_outcome: str
     engine: str
 
     def as_dict(self) -> dict[str, Any]:
@@ -96,6 +99,9 @@ class Prediction:
             "spread_lean": self.spread_lean,
             "total_lean": self.total_lean,
             "total_confidence": round(self.total_confidence, 6),
+            "home_team_total": self.home_team_total,
+            "away_team_total": self.away_team_total,
+            "projected_outcome": self.projected_outcome,
             "engine": self.engine,
         }
 
@@ -232,10 +238,10 @@ def _record_strength(record: str) -> float:
     return max(0.15, min(0.85, wins / total))
 
 
-def _jitter(game_id: str) -> float:
-    digest = hashlib.md5(game_id.encode("utf-8")).hexdigest()[:4]
-    unit = int(digest, 16) / 65535.0
-    return (unit - 0.5) * 0.035
+def _uniform(game_id: str, salt: str, low: float, high: float) -> float:
+    digest = hashlib.md5(f"{game_id}|{salt}".encode("utf-8")).hexdigest()[:8]
+    unit = int(digest, 16) / 0xFFFFFFFF
+    return low + ((high - low) * unit)
 
 
 def _moneyline(probability: float) -> int:
@@ -271,9 +277,15 @@ def predict_game(game: dict[str, Any]) -> Prediction:
 
     rating_diff = home_strength - away_strength
     base = 1.0 / (1.0 + math.exp(-5.5 * (rating_diff + home_advantage)))
+
+    # BetP v3 uses bounded random variance. For serving, derive the same
+    # bounded ranges from the event id so repeated requests are reproducible.
     home_probability = max(
         0.29,
-        min(0.81, base + _jitter(str(game.get("id") or ""))),
+        min(
+            0.81,
+            base + _uniform(str(game.get("id") or ""), "ml", -0.065, 0.065),
+        ),
     )
 
     if home_probability >= 0.53:
@@ -286,27 +298,42 @@ def predict_game(game: dict[str, Any]) -> Prediction:
     pick_probability = max(home_probability, 1 - home_probability)
     moneyline = 0 if pick == "PASS" else _moneyline(pick_probability)
 
+    # Source behavior: fixed 2.5 spread, no alternate spread number.
     if home_probability > 0.55:
         spread = f"{game.get('home_abbr') or 'HOME'} -2.5"
-    elif home_probability < 0.45:
-        spread = f"{game.get('away_abbr') or 'AWAY'} +2.5"
     else:
-        spread = "PASS"
+        spread = f"{game.get('away_abbr') or 'AWAY'} +2.5"
 
     over_probability = max(
         0.36,
         min(
             0.83,
-            0.49
-            + ((pick_probability - 0.5) * 0.32)
-            + (_jitter(str(game.get("id") or "")) * 0.25),
+            (home_probability * 0.34)
+            + _uniform(str(game.get("id") or ""), "ou", 0.39, 0.71),
         ),
     )
-    total_lean = "OVER lean" if over_probability > 0.523 else "UNDER lean"
+    total_lean = "OVER" if over_probability > 0.523 else "UNDER"
     total_confidence = max(
         0.38,
         min(0.92, abs(over_probability - 0.5) * 2.25),
     )
+
+    home_team_total = (
+        "OVER 2.5"
+        if home_probability > 0.52 and over_probability > 0.5
+        else "UNDER 2.5"
+    )
+    away_team_total = (
+        "OVER 2.5"
+        if (1 - home_probability) > 0.52 and over_probability > 0.5
+        else "UNDER 2.5"
+    )
+    side = (
+        str(game.get("home_abbr") or "HOME")
+        if home_probability > 0.5
+        else str(game.get("away_abbr") or "AWAY")
+    )
+    projected_outcome = f"{side} ML + {total_lean}"
 
     return Prediction(
         home_win_probability=home_probability,
@@ -316,7 +343,10 @@ def predict_game(game: dict[str, Any]) -> Prediction:
         spread_lean=spread,
         total_lean=total_lean,
         total_confidence=total_confidence,
-        engine="Philthy Baseline v1 · BetP v3-derived",
+        home_team_total=home_team_total,
+        away_team_total=away_team_total,
+        projected_outcome=projected_outcome,
+        engine="Philthy Baseline v1.1 · BetP v3 deterministic port",
     )
 
 
@@ -344,7 +374,7 @@ def health() -> dict[str, Any]:
     return {
         "status": "ok",
         "service": "PhilthySports",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "engine": os.getenv("PHILTHY_ENGINE_MODE", "baseline"),
         "providers": {
             "odds_api_configured": bool(os.getenv("ODDS_API_KEY")),
@@ -391,13 +421,94 @@ def predictions(
     return {
         "sport": sport_key.upper(),
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "engine": "Philthy Baseline v1 · BetP v3-derived",
+        "engine": "Philthy Baseline v1.1 · BetP v3 deterministic port",
         "snapshot_sha256": snapshot,
         "predictions": rows,
+        "tracking": {
+            "games_predicted": len(rows),
+            "filter": "strict upcoming only",
+            "spread_used": "exactly 2.5",
+            "parlay_sizes": [7, 10, 14],
+            "bankroll_usd": 3.0,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        },
         "governance": {
             "mode": "baseline",
             "powerhouse_bridge": "ready_for_deployment",
             "private_provider_keys_embedded_in_apk": False,
+        },
+    }
+
+
+@app.get("/v1/parlays")
+def parlays(days: int = Query(2, ge=1, le=7)) -> dict[str, Any]:
+    candidates: list[dict[str, Any]] = []
+    snapshots: list[str] = []
+
+    for sport_key in SPORTS:
+        games, snapshot = fetch_games(sport_key, days)
+        snapshots.append(snapshot)
+        for game in games:
+            if not _strict_upcoming(game):
+                continue
+
+            prediction = predict_game(game)
+            matchup = f"{game.get('away_abbr')} @ {game.get('home_abbr')}"
+
+            if prediction.pick != "PASS":
+                candidates.append({
+                    "sport": sport_key.upper(),
+                    "matchup": matchup,
+                    "market": "ML",
+                    "pick": prediction.pick,
+                    "probability": prediction.pick_confidence,
+                })
+
+            if prediction.home_win_probability > 0.58:
+                candidates.append({
+                    "sport": sport_key.upper(),
+                    "matchup": matchup,
+                    "market": "SPREAD 2.5",
+                    "pick": f"{game.get('home_abbr')} -2.5",
+                    "probability": min(0.68, prediction.home_win_probability + 0.04),
+                })
+
+            away_probability = 1 - prediction.home_win_probability
+            if away_probability > 0.58:
+                candidates.append({
+                    "sport": sport_key.upper(),
+                    "matchup": matchup,
+                    "market": "SPREAD 2.5",
+                    "pick": f"{game.get('away_abbr')} +2.5",
+                    "probability": min(0.68, away_probability + 0.04),
+                })
+
+    candidates.sort(key=lambda item: item["probability"], reverse=True)
+
+    def build(size: int, name: str) -> dict[str, Any]:
+        legs = candidates[:size]
+        true_probability = 1.0
+        for leg in legs:
+            true_probability *= float(leg["probability"])
+        decimal = round(1.0 / max(0.0001, true_probability), 2) if legs else 0.0
+        return {
+            "name": name,
+            "legs": len(legs),
+            "target_legs": size,
+            "model_joint_probability": round(true_probability, 8) if legs else 0.0,
+            "est_decimal_odds": decimal,
+            "bankroll_usd": 3.0,
+            "est_payout_usd": round(3.0 * decimal, 2),
+            "selections": legs,
+        }
+
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "snapshot_sha256": hashlib.sha256("".join(snapshots).encode("utf-8")).hexdigest(),
+        "parlays": {
+            "7_leg_conservative": build(7, "7-LEG CONSERVATIVE"),
+            "10_leg_conservative": build(10, "10-LEG CONSERVATIVE"),
+            "14_leg_aggressive": build(14, "14-LEG AGGRESSIVE"),
         },
     }
 
