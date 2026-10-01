@@ -1,0 +1,98 @@
+name: Build PhilthySports Android
+
+on:
+  push:
+    branches:
+      - philthysports
+    paths:
+      - "PhilthySports/**"
+      - ".github/workflows/philthysports-android.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Validate backend source
+        run: python -m py_compile PhilthySports/backend/app.py
+
+      - name: Generate Android wrapper and copy PhilthySports source
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_DIR="$RUNNER_TEMP/philthysports_build"
+          rm -rf "$APP_DIR"
+
+          flutter create             --platforms=android             --org com.philthysports             --project-name philthysports             "$APP_DIR"
+
+          cp PhilthySports/pubspec.yaml "$APP_DIR/pubspec.yaml"
+          rm -rf "$APP_DIR/lib"
+          cp -R PhilthySports/lib "$APP_DIR/lib"
+
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path(__import__("os").environ["RUNNER_TEMP"]) / "philthysports_build/android/app/src/main/AndroidManifest.xml"
+          text = path.read_text()
+
+          if "android.permission.INTERNET" not in text:
+              marker = '<manifest xmlns:android="http://schemas.android.com/apk/res/android">'
+              text = text.replace(
+                  marker,
+                  marker + '\n    <uses-permission android:name="android.permission.INTERNET"/>',
+                  1,
+              )
+
+          text = text.replace('android:label="philthysports"', 'android:label="PhilthySports"')
+          path.write_text(text)
+          PY
+
+          cd "$APP_DIR"
+          flutter pub get
+          flutter build apk --release
+
+          cp build/app/outputs/flutter-apk/app-release.apk             "$GITHUB_WORKSPACE/PhilthySports-release.apk"
+
+      - name: Create checksum
+        run: sha256sum PhilthySports-release.apk | tee PhilthySports-release.apk.sha256
+
+      - name: Package source snapshot
+        run: zip -r PhilthySports-source.zip PhilthySports >/dev/null
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: PhilthySports-APK
+          path: |
+            PhilthySports-release.apk
+            PhilthySports-release.apk.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload source snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: PhilthySports-Source
+          path: PhilthySports-source.zip
+          if-no-files-found: error
+          retention-days: 30
