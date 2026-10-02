@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import time
 import urllib.request
 from pathlib import Path
 
@@ -107,8 +108,19 @@ def audit_sport(manifest, sport, cfg):
     path = cfg["dataset_path"]
     url = f"https://raw.githubusercontent.com/{manifest['source']['repository']}/{commit}/{path}"
     request = urllib.request.Request(url, headers={"User-Agent": "PhilthySports-v6-evidence-audit"})
-    with urllib.request.urlopen(request, timeout=30) as response:
-        body = response.read()
+    last_error = None
+    body = None
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                body = response.read()
+            break
+        except Exception as exc:
+            last_error = exc
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+    if body is None:
+        raise RuntimeError(f"{sport}: could not fetch pinned evidence source") from last_error
 
     actual_sha = git_blob_sha(body)
     assert actual_sha == cfg["blob_sha"], f"{sport}: source blob hash changed"
