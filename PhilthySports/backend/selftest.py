@@ -20,14 +20,24 @@ def main() -> None:
     assert health["pass_for_live"] is False
 
     system = backend.system_status()
-    assert system["release_state"] in {"SHADOW_BASELINE_ONLY", "LIVE_ENABLED"}
-    assert system["gates"]["model_policy"] == "MARKET_BASELINE_ONLY"
+    assert system["release_state"] in {"V6_SHADOW", "V6_LIVE_EVIDENCE_ROUTED"}
+    assert system["gates"]["model_policy"] == "V6_EVIDENCE_ROUTED"
+    assert system["gates"]["chronology"] == "PASS"
+    assert system["gates"]["calibration"] == "PASS"
+    assert system["gates"]["leakage"] == "PASS"
+    assert system["gates"]["credential"] == "PASS_KEYLESS_PRIMARY"
 
     models = backend.models_status()
     assert set(models["sports"]) == {"NFL", "NBA", "MLB", "NHL"}
-    for state in models["sports"].values():
-        assert state["production_state"] == "MARKET_BASELINE_ONLY"
-        assert state["candidate_state"] == "CANDIDATE_SHADOW"
+    assert models["policy"] == "V6_EVIDENCE_ROUTED"
+    assert models["sports"]["MLB"]["production_state"] == "V6_PROMOTED_CALIBRATED_MARKET"
+    assert models["sports"]["MLB"]["promotion_pass"] is True
+    for sport in ("NFL", "NBA", "NHL"):
+        state = models["sports"][sport]
+        assert state["production_state"] == "V6_MARKET_FALLBACK"
+        assert state["candidate_state"] == "V6_CANDIDATE_SHADOW"
+        assert state["promotion_pass"] is False
+        assert state["promotion_blocker"] == "HOLDOUT_DID_NOT_BEAT_MARKET"
 
     protocol = backend.protocol()
     assert protocol["master_protocol"][0] == "Understand"
@@ -123,6 +133,59 @@ def main() -> None:
     assert market_prediction.total_lean == "MARKET 47.5"
     assert market_prediction.total_confidence == 0.0
     assert 0 < market_prediction.home_win_probability < 1
+
+    mlb_built = backend._market_baseline_prediction(market_event, "mlb")
+    assert mlb_built is not None
+    mlb_game, mlb_baseline = mlb_built
+    mlb_promoted = backend._v6_calibrated_prediction("mlb", mlb_game, mlb_baseline)
+    assert mlb_promoted.engine == "Philthy V6 calibrated market candidate v1"
+    assert mlb_promoted.home_win_probability != mlb_baseline.home_win_probability
+
+    retrieved = datetime.now(timezone.utc)
+    espn_fixture = {
+        "id": "espn-market-1",
+        "date": (retrieved + timedelta(hours=3)).isoformat(),
+        "competitions": [{
+            "id": "espn-market-1",
+            "date": (retrieved + timedelta(hours=3)).isoformat(),
+            "competitors": [
+                {"homeAway": "home", "team": {"displayName": "Home Club"}},
+                {"homeAway": "away", "team": {"displayName": "Away Club"}},
+            ],
+            "odds": [{
+                "provider": {"id": "espn", "name": "ESPN BET"},
+                "spread": 2.5,
+                "overUnder": 47.5,
+                "homeTeamOdds": {"favorite": True, "moneyLine": -120},
+                "awayTeamOdds": {"favorite": False, "moneyLine": 110},
+            }],
+        }],
+    }
+    normalized = backend._espn_market_event(espn_fixture, "nfl", retrieved)
+    assert normalized is not None
+    assert normalized["data_quality"] == "PREGAME_KEYLESS"
+    assert normalized["bookmakers"][0]["markets"][0]["key"] == "h2h"
+
+    parlay_candidates = []
+    for i in range(16):
+        sport = ("NFL", "NBA", "MLB", "NHL")[i % 4]
+        parlay_candidates.append({
+            "game_id": f"g-{i}",
+            "sport": sport,
+            "matchup": f"A{i} @ H{i}",
+            "market": "ML",
+            "pick": f"P{i}",
+            "probability": 0.70 - (i * 0.005),
+            "model_state": "V6_MARKET_FALLBACK",
+            "reasoning": "fixture reasoning",
+        })
+    for size in (7, 10, 14):
+        built_parlay = backend._build_multisport_parlay(parlay_candidates, size, f"{size}-LEG")
+        assert built_parlay["legs"] == size
+        assert built_parlay["is_multisport"] is True
+        assert len(built_parlay["sports"]) == 4
+        assert built_parlay["portfolio_reasoning"]
+        assert all(leg["reasoning"] for leg in built_parlay["selections"])
 
     started_payload = [{
         **fresh_payload[0],
