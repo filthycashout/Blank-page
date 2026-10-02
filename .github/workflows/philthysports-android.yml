@@ -123,6 +123,59 @@ jobs:
           curl --fail --silent http://127.0.0.1:18000/v1/protocol | python -m json.tool
 
 
+      - name: Public Powerhouse v6 smoke
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import time
+          import urllib.request
+
+          base = "https://philthysports-powerhouse.onrender.com"
+
+          def get(path, timeout=30):
+              request = urllib.request.Request(
+                  base + path,
+                  headers={"User-Agent": "PhilthySports-CI/1.3"},
+              )
+              with urllib.request.urlopen(request, timeout=timeout) as response:
+                  if response.status != 200:
+                      raise RuntimeError(f"{path}: HTTP {response.status}")
+                  return json.loads(response.read().decode("utf-8"))
+
+          health = None
+          last_error = None
+          for _ in range(36):
+              try:
+                  candidate = get("/health")
+                  if candidate.get("version") == "1.3.0-v6-evidence-routed":
+                      health = candidate
+                      break
+              except Exception as exc:
+                  last_error = exc
+              time.sleep(5)
+
+          if health is None:
+              raise RuntimeError("Powerhouse did not expose v1.3.0") from last_error
+
+          system = get("/v1/system/status")
+          models = get("/v1/models/status")
+          odds = get("/v1/odds/nfl?days=2")
+
+          gates = system["gates"]
+          assert gates["chronology"] == "PASS"
+          assert gates["calibration"] == "PASS"
+          assert gates["leakage"] == "PASS"
+          assert gates["credential"] == "PASS_KEYLESS_PRIMARY"
+          assert gates["model_policy"] == "V6_EVIDENCE_ROUTED"
+          assert gates["pass_for_live"] is True
+          assert models["sports"]["MLB"]["promotion_pass"] is True
+          for sport in ("NFL", "NBA", "NHL"):
+              assert models["sports"][sport]["production_state"] == "V6_MARKET_FALLBACK"
+          assert odds["provider"] == "ESPN keyless pregame market"
+          print("Public Powerhouse v6 smoke: PASS")
+          PY
+
       - name: Generate Android wrapper and copy PhilthySports source
         shell: bash
         run: |
