@@ -6,6 +6,8 @@ import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
+const defaultPowerhouseBackendUrl = 'https://philthysports-powerhouse.onrender.com';
+
 void main() {
   runApp(const PhilthySportsApp());
 }
@@ -532,9 +534,12 @@ class BackendClient {
     return root;
   }
 
-  Future<PredictionBundle> fetchPredictions(SportSpec spec) async {
+  Future<PredictionBundle> fetchPredictions(
+    SportSpec spec, {
+    int days = 2,
+  }) async {
     final uri = Uri.parse(
-      '$_root/v1/predictions/${spec.key.toLowerCase()}?days=2',
+      '$_root/v1/predictions/${spec.key.toLowerCase()}?days=$days',
     );
     final response =
         await http.get(uri).timeout(const Duration(seconds: 18));
@@ -610,23 +615,29 @@ class PredictionRepository {
   final EspnClient espn = EspnClient();
   final PredictionEngine engine = PredictionEngine();
 
-  Future<PredictionBundle> fetch(SportSpec spec) async {
+  Future<PredictionBundle> fetch(
+    SportSpec spec, {
+    int days = 2,
+  }) async {
     final prefs = await SharedPreferences.getInstance();
-    final backendUrl = (prefs.getString('backend_url') ?? '').trim();
+    final useLocalMode = prefs.getBool('use_local_mode') ?? false;
+    final savedBackend = (prefs.getString('backend_url') ?? '').trim();
+    final backendUrl =
+        savedBackend.isNotEmpty ? savedBackend : defaultPowerhouseBackendUrl;
 
-    if (backendUrl.isNotEmpty) {
+    if (!useLocalMode) {
       try {
-        return await BackendClient(backendUrl).fetchPredictions(spec);
+        return await BackendClient(backendUrl).fetchPredictions(spec, days: days);
       } catch (e) {
         throw Exception(
-          'Configured backend failed. PhilthySports will not silently replace '
+          'Powerhouse backend failed. PhilthySports will not silently replace '
           'it with the local shadow engine. Open Settings and choose '
           '"Use local mode" to switch explicitly. Details: $e',
         );
       }
     }
 
-    final snapshot = await espn.fetchWindow(spec, days: 2);
+    final snapshot = await espn.fetchWindow(spec, days: days);
     final records = snapshot.games
         .where((g) => g.isUpcoming)
         .map((g) => PredictionRecord(g, engine.predict(g)))
@@ -918,7 +929,7 @@ class _PicksPageState extends State<PicksPage> {
           const Text(
             'Model outputs are informational estimates, not guarantees. '
             'The on-device engine is visibly PROVISIONAL_SHADOW and is not a promoted production model. '
-            'The backend keeps production at MARKET_BASELINE_ONLY until the v6 chronology, calibration, leakage, and credential gates pass.',
+            'Production uses V6_EVIDENCE_ROUTED. Promoted candidates run only where untouched holdout evidence clears the market; other sports remain on a governed market fallback.',
             style: TextStyle(fontSize: 12, color: Colors.white60),
           ),
         ],
@@ -928,18 +939,22 @@ class _PicksPageState extends State<PicksPage> {
 }
 
 class _ParlayLeg {
+  final String gameId;
   final String sport;
   final String matchup;
   final String market;
   final String pick;
   final double probability;
+  final String reasoning;
 
   const _ParlayLeg({
+    required this.gameId,
     required this.sport,
     required this.matchup,
     required this.market,
     required this.pick,
     required this.probability,
+    required this.reasoning,
   });
 }
 
@@ -969,48 +984,31 @@ class _ParlayPageState extends State<ParlayPage> {
     });
     try {
       final bundles = await Future.wait(
-        sportSpecs.map((spec) => _repo.fetch(spec)),
+        sportSpecs.map((spec) => _repo.fetch(spec, days: 7)),
       );
 
       final candidates = <_ParlayLeg>[];
-      for (final record in bundles.expand((b) => b.records)) {
-        final game = record.game;
-        final p = record.prediction;
-        final matchup = '${game.awayAbbr} @ ${game.homeAbbr}';
-
-        if (p.pick != 'PASS') {
+      for (final bundle in bundles) {
+        for (final record in bundle.records) {
+          final game = record.game;
+          final p = record.prediction;
+          if (p.pick == 'PASS' || p.pickConfidence < 0.53) continue;
+          final matchup = '${game.awayAbbr} @ ${game.homeAbbr}';
+          final band = p.pickConfidence >= 0.65
+              ? 'Top-tier side confidence'
+              : p.pickConfidence >= 0.58
+                  ? 'Qualified side confidence'
+                  : 'Minimum qualified side confidence';
           candidates.add(
             _ParlayLeg(
+              gameId: game.id,
               sport: game.sport,
               matchup: matchup,
               market: 'ML',
               pick: p.pick,
               probability: p.pickConfidence,
-            ),
-          );
-        }
-
-        if (p.homeWinProbability > 0.58) {
-          candidates.add(
-            _ParlayLeg(
-              sport: game.sport,
-              matchup: matchup,
-              market: 'SPREAD 2.5',
-              pick: '${game.homeAbbr} -2.5',
-              probability: math.min(0.68, p.homeWinProbability + 0.04),
-            ),
-          );
-        }
-
-        final awayProbability = 1 - p.homeWinProbability;
-        if (awayProbability > 0.58) {
-          candidates.add(
-            _ParlayLeg(
-              sport: game.sport,
-              matchup: matchup,
-              market: 'SPREAD 2.5',
-              pick: '${game.awayAbbr} +2.5',
-              probability: math.min(0.68, awayProbability + 0.04),
+              reasoning:
+                  '$band · ${bundle.modelState} · strict pregame filter passed.',
             ),
           );
         }
@@ -1018,7 +1016,7 @@ class _ParlayPageState extends State<ParlayPage> {
 
       candidates.sort((a, b) => b.probability.compareTo(a.probability));
       if (!mounted) return;
-      setState(() => _legs = candidates.take(math.min(14, candidates.length)).toList());
+      setState(() => _legs = candidates);
     } catch (e) {
       if (!mounted) return;
       setState(() => _error = e.toString());
@@ -1027,8 +1025,48 @@ class _ParlayPageState extends State<ParlayPage> {
     }
   }
 
+  List<_ParlayLeg> _balancedSelection(int targetLegs) {
+    final groups = <String, List<_ParlayLeg>>{};
+    for (final leg in _legs) {
+      groups.putIfAbsent(leg.sport, () => <_ParlayLeg>[]).add(leg);
+    }
+
+    final selected = <_ParlayLeg>[];
+    final usedGames = <String>{};
+    final offsets = <String, int>{for (final key in groups.keys) key: 0};
+    final sports = sportSpecs.map((s) => s.key).where(groups.containsKey).toList();
+
+    while (selected.length < targetLegs) {
+      var progressed = false;
+      for (final sport in sports) {
+        final pool = groups[sport]!;
+        var index = offsets[sport] ?? 0;
+        while (index < pool.length && usedGames.contains(pool[index].gameId)) {
+          index++;
+        }
+        offsets[sport] = index + 1;
+        if (index >= pool.length) continue;
+        final leg = pool[index];
+        selected.add(leg);
+        usedGames.add(leg.gameId);
+        progressed = true;
+        if (selected.length >= targetLegs) break;
+      }
+      if (!progressed) break;
+    }
+
+    if (selected.length < targetLegs) {
+      for (final leg in _legs) {
+        if (selected.contains(leg)) continue;
+        selected.add(leg);
+        if (selected.length >= targetLegs) break;
+      }
+    }
+    return selected.take(math.min(targetLegs, selected.length)).toList();
+  }
+
   Widget _parlayCard(String title, int targetLegs, {required bool aggressive}) {
-    final selected = _legs.take(math.min(targetLegs, _legs.length)).toList();
+    final selected = _balancedSelection(targetLegs);
     if (selected.isEmpty) return const SizedBox.shrink();
 
     var jointProbability = 1.0;
@@ -1083,6 +1121,13 @@ class _ParlayPageState extends State<ParlayPage> {
               ],
             ),
             const Divider(height: 24),
+            Text(
+              'Why this mix: ${selected.map((e) => e.sport).toSet().length} sports represented · '
+              'one ML leg per game where possible · highest qualified confidence rotated across sports · '
+              'joint probability uses the independence fallback.',
+              style: const TextStyle(color: Colors.white70),
+            ),
+            const SizedBox(height: 12),
             ...selected.asMap().entries.map((entry) {
               final leg = entry.value;
               return Padding(
@@ -1100,7 +1145,8 @@ class _ParlayPageState extends State<ParlayPage> {
                     Expanded(
                       child: Text(
                         '${leg.sport} · ${leg.matchup} · ${leg.market}\n'
-                        '${leg.pick} · ${(leg.probability * 100).toStringAsFixed(1)}%',
+                        '${leg.pick} · ${(leg.probability * 100).toStringAsFixed(1)}%\n'
+                        'Why: ${leg.reasoning}',
                       ),
                     ),
                   ],
@@ -1131,7 +1177,7 @@ class _ParlayPageState extends State<ParlayPage> {
             icon: Icons.layers,
             title: 'BetP v3 multi-parlay engine',
             subtitle:
-                r'7-leg conservative · 10-leg conservative · 14-leg aggressive · fixed $3 bankroll',
+                r'7-leg multisport · 10-leg multisport · 14-leg multisport · fixed $3 bankroll',
           ),
           const SizedBox(height: 10),
           if (_legs.isEmpty)
@@ -1140,13 +1186,13 @@ class _ParlayPageState extends State<ParlayPage> {
               text: 'Refresh later as new schedules enter the ESPN feed.',
             )
           else ...[
-            _parlayCard('7-LEG CONSERVATIVE', 7, aggressive: false),
-            _parlayCard('10-LEG CONSERVATIVE', 10, aggressive: false),
-            _parlayCard('14-LEG AGGRESSIVE', 14, aggressive: true),
+            _parlayCard('7-LEG MULTISPORT', 7, aggressive: false),
+            _parlayCard('10-LEG MULTISPORT', 10, aggressive: false),
+            _parlayCard('14-LEG MULTISPORT', 14, aggressive: true),
             const Text(
               'Fair decimal and payout are model-derived estimates only. '
-              'They are not sportsbook odds and do not account for correlation, '
-              'bookmaker margin, limits, or leg eligibility.',
+              'They are not sportsbook odds. Joint probability uses an independence fallback '
+              'and does not prove the legs are statistically independent.',
               style: TextStyle(fontSize: 12, color: Colors.white60),
             ),
           ],
@@ -1179,12 +1225,22 @@ class _SettingsPageState extends State<SettingsPage> {
 
   Future<void> _load() async {
     final prefs = await SharedPreferences.getInstance();
-    _controller.text = prefs.getString('backend_url') ?? '';
-    if (mounted) setState(() => _loaded = true);
+    final localMode = prefs.getBool('use_local_mode') ?? false;
+    _controller.text =
+        prefs.getString('backend_url') ?? defaultPowerhouseBackendUrl;
+    if (mounted) {
+      setState(() {
+        _loaded = true;
+        if (localMode) {
+          _status = 'Local mode is active. Save the Powerhouse URL to reconnect.';
+        }
+      });
+    }
   }
 
   Future<void> _save() async {
-    final value = _controller.text.trim();
+    final typed = _controller.text.trim();
+    final value = typed.isEmpty ? defaultPowerhouseBackendUrl : typed;
     if (value.isNotEmpty) {
       final uri = Uri.tryParse(value);
       if (uri == null || uri.scheme.toLowerCase() != 'https' || uri.host.isEmpty) {
@@ -1195,17 +1251,16 @@ class _SettingsPageState extends State<SettingsPage> {
 
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('backend_url', value);
+    await prefs.setBool('use_local_mode', false);
+    _controller.text = value;
     if (mounted) {
       setState(() => _status = 'Saved. New prediction requests will use this backend first.');
     }
   }
 
   Future<void> _test() async {
-    final value = _controller.text.trim();
-    if (value.isEmpty) {
-      setState(() => _status = 'Enter a backend URL first.');
-      return;
-    }
+    final typed = _controller.text.trim();
+    final value = typed.isEmpty ? defaultPowerhouseBackendUrl : typed;
     setState(() {
       _testing = true;
       _status = null;
@@ -1260,7 +1315,7 @@ class _SettingsPageState extends State<SettingsPage> {
                 ),
                 const SizedBox(height: 8),
                 const Text(
-                  'Example: https://sports-api.example.com',
+                  'Default: https://philthysports-powerhouse.onrender.com',
                   style: TextStyle(color: Colors.white60),
                 ),
                 const SizedBox(height: 12),
@@ -1296,12 +1351,11 @@ class _SettingsPageState extends State<SettingsPage> {
                     ),
                     TextButton(
                       onPressed: () async {
-                        _controller.clear();
                         final prefs = await SharedPreferences.getInstance();
-                        await prefs.remove('backend_url');
+                        await prefs.setBool('use_local_mode', true);
                         if (mounted) {
                           setState(() => _status =
-                              'Backend cleared. Using keyless local mode.');
+                              'Local mode enabled explicitly. Powerhouse URL is preserved for reconnecting.');
                         }
                       },
                       child: const Text('Use local mode'),
@@ -1340,24 +1394,33 @@ class _SettingsPageState extends State<SettingsPage> {
                   ),
                 ] else ...[
                   Text(
-                    'Credential rotation: ${_asMap(_systemStatus!['gates'])['credential_rotation'] ?? 'UNKNOWN'}',
+                    'Active credential gate: ${_asMap(_systemStatus!['gates'])['credential'] ?? 'UNKNOWN'}',
                   ),
                   Text(
                     'Release state: ${_systemStatus!['release_state'] ?? 'UNKNOWN'}',
+                  ),
+                  Text(
+                    'Chronology: ${_asMap(_systemStatus!['gates'])['chronology'] ?? 'UNKNOWN'} · '
+                    'Calibration: ${_asMap(_systemStatus!['gates'])['calibration'] ?? 'UNKNOWN'} · '
+                    'Leakage: ${_asMap(_systemStatus!['gates'])['leakage'] ?? 'UNKNOWN'}',
+                  ),
+                  Text(
+                    'Legacy secret rotation: ${_asMap(_systemStatus!['gates'])['legacy_secret_provider_rotation'] ?? 'UNKNOWN'}',
+                    style: const TextStyle(color: Colors.white60),
                   ),
                   const SizedBox(height: 8),
                   ...sportSpecs.map((sport) {
                     final sports = _asMap(_modelsStatus?['sports']);
                     final row = _asMap(sports[sport.key]);
                     return Text(
-                      '${sport.key}: ${row['production_state'] ?? 'MARKET_BASELINE_ONLY'} · ${row['candidate_state'] ?? 'CANDIDATE_SHADOW'}',
+                      '${sport.key}: ${row['production_state'] ?? 'V6_MARKET_FALLBACK'} · ${row['candidate_state'] ?? 'V6_CANDIDATE_SHADOW'}',
                     );
                   }),
                 ],
                 const SizedBox(height: 10),
                 const Text(
-                  'Promotion stays blocked until qualifying timestamped pregame evidence and the production gates pass. '
-                  'The APK does not turn missing prerequisites into a green status.',
+                  'V6 routing is evidence-specific. MLB is promoted only because its historical untouched holdout clears the market criteria; '
+                  'NFL, NBA, and NHL stay on governed market fallback until their candidates do the same. Legacy exposed secret providers remain blocked from reuse until rotated.',
                   style: TextStyle(color: Colors.white60),
                 ),
               ],
@@ -1396,7 +1459,7 @@ class _SettingsPageState extends State<SettingsPage> {
           child: Padding(
             padding: EdgeInsets.all(16),
             child: Text(
-              'Build: PhilthySports 1.2.1\n'
+              'Build: PhilthySports 1.3.0\n'
               'Protocol: v6 integration gates + tamper-evident ledger\n'
               'Direct mode: ESPN scoreboard + PROVISIONAL_SHADOW\n'
               'Backend: /v1/system/status · /v1/models/status · /v1/predictions/latest\n'
