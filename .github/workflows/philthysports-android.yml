@@ -77,12 +77,16 @@ jobs:
           python -m py_compile PhilthySports/backend/selftest.py
           python -m py_compile PhilthySports/backend/secret_scan.py
           python -m py_compile PhilthySports/backend/live_smoke.py
+          python -m py_compile PhilthySports/backend/v6_evidence_audit.py
 
       - name: Install backend test dependencies
         run: python -m pip install -r PhilthySports/backend/requirements.txt
 
       - name: Secret scan
         run: python PhilthySports/backend/secret_scan.py
+
+      - name: Reproduce v6 chronology calibration leakage evidence
+        run: python PhilthySports/backend/v6_evidence_audit.py
 
       - name: Backend v6 contract selftest
         env:
