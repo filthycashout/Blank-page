@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: philthysports-powerhouse
+    runtime: docker
+    plan: free
+    region: oregon
+    repo: https://github.com/filthycashout/Blank-page
+    branch: philthysports
+    dockerfilePath: ./PhilthySports/backend/Dockerfile
+    dockerContext: ./PhilthySports/backend
+    healthCheckPath: /health
+    autoDeployTrigger: checksPass
+    renderSubdomainPolicy: enabled
+    envVars:
+      - key: CREDENTIAL_ROTATION_CONFIRMED
+        value: "false"
+      - key: PHILTHY_LIVE_ENABLED
+        value: "false"
+      - key: PHILTHY_ENGINE_MODE
+        value: market_baseline_only
+      - key: PHILTHY_RUNTIME_DIR
+        value: /tmp/philthysports
+      - key: ODDS_MAX_AGE_MINUTES
+        value: "15"
+      - key: ODDS_API_KEY
+        sync: false
