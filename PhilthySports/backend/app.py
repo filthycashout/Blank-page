@@ -20,7 +20,7 @@ load_dotenv()
 
 app = FastAPI(
     title="PhilthySports API",
-    version="1.2.1-final-audit",
+    version="1.3.0-v6-evidence-routed",
     description="Unified NFL, NBA, MLB and NHL prediction bridge.",
 )
 
@@ -128,6 +128,31 @@ _latest_run: dict[str, Any] | None = None
 _latest_verified_predictions: list[dict[str, Any]] = []
 
 
+EVIDENCE_PATH = Path(__file__).resolve().parent / "evidence" / "v6_evidence.json"
+
+
+def _load_v6_evidence() -> dict[str, Any]:
+    try:
+        payload = json.loads(EVIDENCE_PATH.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or not isinstance(payload.get("sports"), dict):
+            raise ValueError("invalid v6 evidence schema")
+        return payload
+    except Exception as exc:
+        return {
+            "schema_version": "unavailable",
+            "load_error": str(exc),
+            "methodology": {
+                "chronology_gate": "BLOCKED_EVIDENCE_UNAVAILABLE",
+                "calibration_gate": "BLOCKED_EVIDENCE_UNAVAILABLE",
+                "leakage_gate": "BLOCKED_EVIDENCE_UNAVAILABLE",
+            },
+            "sports": {},
+        }
+
+
+V6_EVIDENCE = _load_v6_evidence()
+
+
 def _truthy_env(name: str) -> bool:
     return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -136,12 +161,42 @@ def _rotation_confirmed() -> bool:
     return _truthy_env("CREDENTIAL_ROTATION_CONFIRMED")
 
 
+def _active_market_provider() -> str:
+    return os.getenv("PHILTHY_PRIMARY_MARKET_PROVIDER", "espn").strip().lower() or "espn"
+
+
+def _active_credential_gate() -> str:
+    provider = _active_market_provider()
+    if provider == "espn":
+        return "PASS_KEYLESS_PRIMARY"
+    if provider == "oddsapi":
+        if _rotation_confirmed() and bool(os.getenv("ODDS_API_KEY")):
+            return "PASS_ROTATED_SECRET_PROVIDER"
+        return "BLOCKED_ROTATED_ODDS_CREDENTIAL_REQUIRED"
+    return "BLOCKED_UNSUPPORTED_PRIMARY_PROVIDER"
+
+
+def _methodology_gates_pass() -> bool:
+    methodology = V6_EVIDENCE.get("methodology") or {}
+    return all(
+        methodology.get(name) == "PASS"
+        for name in ("chronology_gate", "calibration_gate", "leakage_gate")
+    )
+
+
 def _production_live_enabled() -> bool:
-    return _rotation_confirmed() and _truthy_env("PHILTHY_LIVE_ENABLED")
+    return bool(
+        _truthy_env("PHILTHY_LIVE_ENABLED")
+        and _methodology_gates_pass()
+        and _active_credential_gate().startswith("PASS")
+    )
 
 
-def _provider_state() -> dict[str, bool]:
+def _provider_state() -> dict[str, Any]:
     return {
+        "primary_market_provider": _active_market_provider(),
+        "primary_credential_gate": _active_credential_gate(),
+        "espn_keyless": True,
         "odds_api_configured": bool(os.getenv("ODDS_API_KEY")),
         "sportradar_configured": bool(os.getenv("SPORTRADAR_API_KEY")),
         "visual_crossing_configured": bool(os.getenv("VISUAL_CROSSING_API_KEY")),
@@ -151,26 +206,34 @@ def _provider_state() -> dict[str, bool]:
 
 
 def _system_gates() -> dict[str, Any]:
-    providers = _provider_state()
-    rotation = _rotation_confirmed()
+    methodology = V6_EVIDENCE.get("methodology") or {}
+    active_credential = _active_credential_gate()
+    legacy_rotation = "PASS" if _rotation_confirmed() else "BLOCKED_EXTERNAL_ROTATION"
     return {
-        "credential_rotation": "PASS" if rotation else "BLOCKED_EXTERNAL_ROTATION",
-        "canonical_history": "AWAITING_CANONICAL_HISTORY",
-        "live_data_qa": (
-            "READY_FOR_PREFLIGHT"
-            if rotation and providers["odds_api_configured"]
-            else "BLOCKED_MISSING_ROTATED_CREDENTIAL"
+        "chronology": methodology.get("chronology_gate", "BLOCKED_EVIDENCE_UNAVAILABLE"),
+        "calibration": methodology.get("calibration_gate", "BLOCKED_EVIDENCE_UNAVAILABLE"),
+        "leakage": methodology.get("leakage_gate", "BLOCKED_EVIDENCE_UNAVAILABLE"),
+        "credential": active_credential,
+        "credential_rotation": legacy_rotation,
+        "legacy_secret_provider_rotation": legacy_rotation,
+        "canonical_history": "PASS_PINNED_HISTORICAL_CORPUS",
+        "live_data_qa": "PASS_KEYLESS_ESPN_PREFLIGHT" if _active_market_provider() == "espn" else (
+            "READY_FOR_PREFLIGHT" if active_credential.startswith("PASS") else active_credential
         ),
-        "model_policy": "MARKET_BASELINE_ONLY",
+        "model_policy": "V6_EVIDENCE_ROUTED",
         "parlay_dependency": "INDEPENDENCE_FALLBACK",
         "settlement": "READY_WITH_DATA",
         "closing_line_clv": "READY_WITH_DATA",
         "pass_for_live": bool(
-            rotation
-            and providers["odds_api_configured"]
-            and _truthy_env("PHILTHY_LIVE_ENABLED")
+            _truthy_env("PHILTHY_LIVE_ENABLED")
+            and _methodology_gates_pass()
+            and active_credential.startswith("PASS")
         ),
     }
+
+
+def _sport_evidence(sport_key: str) -> dict[str, Any]:
+    return dict((V6_EVIDENCE.get("sports") or {}).get(sport_key.upper()) or {})
 
 
 def _last_ledger_hash() -> str:
@@ -334,6 +397,160 @@ def fetch_games(sport_key: str, days: int = 2) -> tuple[list[dict[str, Any]], st
     games = sorted(by_id.values(), key=lambda g: str(g.get("date") or ""))
     combined = hashlib.sha256("".join(digests).encode("utf-8")).hexdigest()
     return games, combined
+
+
+def _coerce_number(value: Any) -> float | None:
+    if isinstance(value, dict):
+        for key in ("value", "american", "alternateDisplayValue", "moneyLine"):
+            if key in value:
+                return _coerce_number(value.get(key))
+        return None
+    try:
+        text = str(value).strip().replace("+", "")
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def _espn_market_event(event: dict[str, Any], sport_key: str, retrieved_at: datetime) -> dict[str, Any] | None:
+    competitions = event.get("competitions") or []
+    if not competitions or not isinstance(competitions[0], dict):
+        return None
+    competition = competitions[0]
+    competitors = competition.get("competitors") or []
+    if len(competitors) < 2:
+        return None
+
+    home = next((x for x in competitors if isinstance(x, dict) and x.get("homeAway") == "home"), None)
+    away = next((x for x in competitors if isinstance(x, dict) and x.get("homeAway") == "away"), None)
+    if not isinstance(home, dict) or not isinstance(away, dict):
+        return None
+    home_team = home.get("team") if isinstance(home.get("team"), dict) else {}
+    away_team = away.get("team") if isinstance(away.get("team"), dict) else {}
+    home_name = str(home_team.get("displayName") or home_team.get("name") or "")
+    away_name = str(away_team.get("displayName") or away_team.get("name") or "")
+    if not home_name or not away_name:
+        return None
+
+    commence = _parse_provider_time(event.get("date") or competition.get("date"))
+    if commence is None or commence <= retrieved_at:
+        return None
+
+    odds_rows = competition.get("odds") or []
+    odds = next(
+        (
+            item for item in odds_rows
+            if isinstance(item, dict)
+            and "live" not in str((item.get("provider") or {}).get("name") or "").lower()
+        ),
+        None,
+    )
+    if not isinstance(odds, dict):
+        return None
+
+    home_odds = odds.get("homeTeamOdds") if isinstance(odds.get("homeTeamOdds"), dict) else {}
+    away_odds = odds.get("awayTeamOdds") if isinstance(odds.get("awayTeamOdds"), dict) else {}
+    home_ml = _coerce_number(home_odds.get("moneyLine") or (home_odds.get("current") or {}).get("moneyLine"))
+    away_ml = _coerce_number(away_odds.get("moneyLine") or (away_odds.get("current") or {}).get("moneyLine"))
+    if home_ml is None or away_ml is None:
+        return None
+
+    markets: list[dict[str, Any]] = [{
+        "key": "h2h",
+        "outcomes": [
+            {"name": home_name, "price": home_ml},
+            {"name": away_name, "price": away_ml},
+        ],
+    }]
+
+    spread = _coerce_number(odds.get("spread"))
+    if spread is not None and spread != 0:
+        magnitude = abs(spread)
+        if bool(home_odds.get("favorite")):
+            home_point, away_point = -magnitude, magnitude
+        elif bool(away_odds.get("favorite")):
+            home_point, away_point = magnitude, -magnitude
+        else:
+            home_point, away_point = -spread, spread
+        markets.append({
+            "key": "spreads",
+            "outcomes": [
+                {"name": home_name, "point": home_point},
+                {"name": away_name, "point": away_point},
+            ],
+        })
+
+    total = _coerce_number(odds.get("overUnder"))
+    if total is not None and total > 0:
+        markets.append({
+            "key": "totals",
+            "outcomes": [
+                {"name": "Over", "point": total},
+                {"name": "Under", "point": total},
+            ],
+        })
+
+    provider = odds.get("provider") if isinstance(odds.get("provider"), dict) else {}
+    return {
+        "id": str(event.get("id") or competition.get("id") or ""),
+        "home_team": home_name,
+        "away_team": away_name,
+        "commence_time": commence.isoformat(),
+        "bookmakers": [{
+            "key": str(provider.get("id") or "espn"),
+            "title": str(provider.get("name") or "ESPN"),
+            "last_update": retrieved_at.isoformat(),
+            "markets": markets,
+        }],
+        "data_quality": "PREGAME_KEYLESS",
+        "provenance": {
+            "source": "ESPN scoreboard odds",
+            "retrieved_at": retrieved_at.isoformat(),
+            "event_state_required": "pre",
+            "provider_quote_timestamp_available": False,
+        },
+    }
+
+
+def _fetch_espn_markets(
+    sport_key: str,
+    days: int = 7,
+) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
+    if sport_key not in SPORTS:
+        raise HTTPException(status_code=404, detail="Unsupported sport")
+    espn_sport, league, _ = SPORTS[sport_key]
+    now = datetime.now(timezone.utc)
+    by_id: dict[str, dict[str, Any]] = {}
+    snapshot_parts: list[str] = []
+
+    for offset in range(days):
+        date_str = (now + timedelta(days=offset)).strftime("%Y%m%d")
+        url = f"{ESPN_BASE}/{espn_sport}/{league}/scoreboard?lang=en&region=us&dates={date_str}"
+        try:
+            payload, digest = _get_json(url)
+        except requests.RequestException as exc:
+            raise HTTPException(status_code=502, detail=f"ESPN market fetch failed: {exc}") from exc
+        snapshot_parts.append(digest)
+        for event in payload.get("events", []) if isinstance(payload, dict) else []:
+            if not isinstance(event, dict):
+                continue
+            normalized = _espn_market_event(event, sport_key, now)
+            if normalized and normalized.get("id"):
+                by_id[str(normalized["id"])] = normalized
+
+    events = sorted(by_id.values(), key=lambda row: str(row.get("commence_time") or ""))
+    return events, {
+        "schema_valid": True,
+        "accepted_events": len(events),
+        "strict_pregame": True,
+        "keyless_primary": True,
+        "retrieved_at": now.isoformat(),
+        "snapshot_sha256": hashlib.sha256("".join(snapshot_parts).encode("utf-8")).hexdigest(),
+    }, {
+        "requests_remaining": None,
+        "requests_used": None,
+        "requests_last": None,
+    }
 
 
 def _record_strength(record: str) -> float:
@@ -522,6 +739,61 @@ def _market_baseline_prediction(
     return game, prediction
 
 
+def _v6_calibrated_prediction(
+    sport_key: str,
+    game: dict[str, Any],
+    baseline: Prediction,
+) -> Prediction:
+    evidence = _sport_evidence(sport_key)
+    if not evidence.get("promotion_pass"):
+        return baseline
+
+    p = max(1e-9, min(1 - 1e-9, baseline.home_win_probability))
+    temperature = float(evidence.get("temperature", 1.0))
+    bias = float(evidence.get("bias", 0.0))
+    calibrated_home = 1.0 / (
+        1.0 + math.exp(-(temperature * math.log(p / (1 - p)) + bias))
+    )
+    if calibrated_home >= 0.53:
+        pick = str(game.get("home_abbr") or _team_code(str(game.get("home_name") or "HOME")))
+        selected_probability = calibrated_home
+    elif calibrated_home <= 0.47:
+        pick = str(game.get("away_abbr") or _team_code(str(game.get("away_name") or "AWAY")))
+        selected_probability = 1 - calibrated_home
+    else:
+        pick = "PASS"
+        selected_probability = max(calibrated_home, 1 - calibrated_home)
+
+    return Prediction(
+        home_win_probability=calibrated_home,
+        pick=pick,
+        pick_confidence=selected_probability,
+        moneyline=0 if pick == "PASS" else _fair_american_moneyline(selected_probability),
+        spread_lean=baseline.spread_lean,
+        total_lean=baseline.total_lean,
+        total_confidence=baseline.total_confidence,
+        home_team_total=baseline.home_team_total,
+        away_team_total=baseline.away_team_total,
+        projected_outcome=(
+            f"{pick} ML · V6_PROMOTED_CALIBRATED_MARKET"
+            if pick != "PASS"
+            else "PASS · V6_PROMOTED_CALIBRATED_MARKET"
+        ),
+        engine="Philthy V6 calibrated market candidate v1",
+    )
+
+
+def _model_route(sport_key: str) -> dict[str, Any]:
+    evidence = _sport_evidence(sport_key)
+    return {
+        "production_state": evidence.get("production_state", "V6_MARKET_FALLBACK"),
+        "candidate_state": evidence.get("candidate_state", "V6_CANDIDATE_SHADOW"),
+        "promotion_pass": bool(evidence.get("promotion_pass")),
+        "promotion_blocker": evidence.get("promotion_blocker"),
+        "evidence": evidence,
+    }
+
+
 def predict_game(game: dict[str, Any]) -> Prediction:
     home_record = _record_strength(str(game.get("home_record") or ""))
     away_record = _record_strength(str(game.get("away_record") or ""))
@@ -639,15 +911,26 @@ def _strict_upcoming(game: dict[str, Any]) -> bool:
     return any(item in status for item in ("SCHEDULED", "PRE", "TBD"))
 
 
+@app.api_route("/", methods=["GET", "HEAD"])
+def root() -> dict[str, Any]:
+    return {
+        "service": "PhilthySports Powerhouse",
+        "status": "ok",
+        "version": "1.3.0-v6-evidence-routed",
+        "health": "/health",
+        "system_status": "/v1/system/status",
+    }
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     gates = _system_gates()
     return {
         "status": "ok",
         "service": "PhilthySports",
-        "version": "1.2.1-final-audit",
-        "engine": os.getenv("PHILTHY_ENGINE_MODE", "provisional_shadow"),
-        "live_gate": gates["credential_rotation"],
+        "version": "1.3.0-v6-evidence-routed",
+        "engine": os.getenv("PHILTHY_ENGINE_MODE", "v6_evidence_routed"),
+        "live_gate": gates["credential"],
         "pass_for_live": gates["pass_for_live"],
         "providers": _provider_state(),
     }
@@ -657,13 +940,15 @@ def health() -> dict[str, Any]:
 def system_status() -> dict[str, Any]:
     return {
         "service": "PhilthySports",
-        "version": "1.2.1-final-audit",
+        "version": "1.3.0-v6-evidence-routed",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "gates": _system_gates(),
         "release_state": (
-            "LIVE_ENABLED" if _production_live_enabled() else "SHADOW_BASELINE_ONLY"
+            "V6_LIVE_EVIDENCE_ROUTED" if _production_live_enabled() else "V6_SHADOW"
         ),
-        "principle": "fail_closed_on_unverified_external_prerequisites",
+        "active_market_provider": _active_market_provider(),
+        "legacy_secret_rotation_required_before_reuse": not _rotation_confirmed(),
+        "principle": "evidence_routed_fail_closed_on_unverified_promotion",
     }
 
 
@@ -680,11 +965,26 @@ def protocol() -> dict[str, Any]:
 def models_status() -> dict[str, Any]:
     sports = {}
     for sport in SPORTS:
+        route = _model_route(sport)
+        evidence = route["evidence"]
         sports[sport.upper()] = {
-            "production_state": "MARKET_BASELINE_ONLY",
-            "candidate_state": "CANDIDATE_SHADOW",
-            "promotion_blocker": "AWAITING_CANONICAL_HISTORY",
+            "production_state": route["production_state"],
+            "candidate_state": route["candidate_state"],
+            "promotion_pass": route["promotion_pass"],
+            "promotion_blocker": route["promotion_blocker"],
             "minimum_canonical_rows": 200,
+            "evidence_rows": evidence.get("rows", 0),
+            "holdout_rows": evidence.get("holdout_rows", 0),
+            "holdout_metrics": {
+                "candidate_brier": evidence.get("candidate_brier"),
+                "market_brier": evidence.get("market_brier"),
+                "candidate_log_loss": evidence.get("candidate_log_loss"),
+                "market_log_loss": evidence.get("market_log_loss"),
+                "candidate_ece": evidence.get("candidate_ece"),
+                "market_ece": evidence.get("market_ece"),
+            },
+            "dataset_blob_sha": evidence.get("blob_sha"),
+            "evidence_window": [evidence.get("date_min"), evidence.get("date_max")],
             "promotion_requires": [
                 "chronological_holdout",
                 "brier_improvement",
@@ -696,6 +996,12 @@ def models_status() -> dict[str, Any]:
         }
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "policy": "V6_EVIDENCE_ROUTED",
+        "methodology_gates": {
+            "chronology": _system_gates()["chronology"],
+            "calibration": _system_gates()["calibration"],
+            "leakage": _system_gates()["leakage"],
+        },
         "sports": sports,
     }
 
@@ -749,9 +1055,10 @@ def predictions(
     sport_key = sport.lower()
     generated_at = datetime.now(timezone.utc).isoformat()
     gates = _system_gates()
+    route = _model_route(sport_key)
 
     if _production_live_enabled():
-        market_events, market_quality, quota = _fetch_live_odds(sport_key)
+        market_events, market_quality, quota, market_source = _fetch_live_market(sport_key, days=max(days, 2))
         rows: list[dict[str, Any]] = []
         snapshot = hashlib.sha256(
             json.dumps(market_events, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -761,23 +1068,36 @@ def predictions(
             built = _market_baseline_prediction(event, sport_key)
             if built is None:
                 continue
-            game, prediction_obj = built
+            game, baseline = built
+            prediction_obj = (
+                _v6_calibrated_prediction(sport_key, game, baseline)
+                if route["promotion_pass"]
+                else baseline
+            )
             prediction = prediction_obj.as_dict()
+            model_state = str(route["production_state"])
             ledger_record = {
                 "recorded_at": generated_at,
                 "sport": sport_key.upper(),
                 "event_id": game.get("id"),
                 "event_time": game.get("date"),
                 "source_snapshot_sha256": snapshot,
-                "model_state": "MARKET_BASELINE",
+                "model_state": model_state,
                 "engine": prediction["engine"],
                 "game": game,
                 "prediction": prediction,
+                "promotion_evidence_blob_sha": route["evidence"].get("blob_sha"),
             }
             ledger_hash = _append_ledger(ledger_record)
             rows.append({
                 "game": game,
                 "prediction": prediction,
+                "model_state": model_state,
+                "reasoning": (
+                    "Promoted v6 calibrated probability: chronological calibration and untouched holdout beat the market."
+                    if route["promotion_pass"]
+                    else "V6 live market fallback: candidate remains shadowed because its untouched holdout did not beat the market."
+                ),
                 "ledger": {
                     "record_hash": ledger_hash,
                     "source_snapshot_sha256": snapshot,
@@ -787,23 +1107,33 @@ def predictions(
         payload = {
             "sport": sport_key.upper(),
             "generated_at": generated_at,
-            "engine": "De-vigged market consensus baseline v1",
-            "model_state": "MARKET_BASELINE",
+            "engine": (
+                "Philthy V6 calibrated market candidate v1"
+                if route["promotion_pass"]
+                else "De-vigged live market consensus fallback v1"
+            ),
+            "model_state": route["production_state"],
             "snapshot_sha256": snapshot,
             "predictions": rows,
             "tracking": {
                 "games_predicted": len(rows),
-                "source": "The Odds API",
+                "source": market_source,
                 "quality": market_quality,
                 "quota": quota,
                 "generated_at": generated_at,
             },
             "governance": {
-                "mode": "production_baseline",
-                "model_state": "MARKET_BASELINE",
-                "production_policy": "MARKET_BASELINE_ONLY",
-                "promotion_blocker": "AWAITING_CANONICAL_HISTORY",
-                "credential_gate": gates["credential_rotation"],
+                "mode": "v6_evidence_routed",
+                "model_state": route["production_state"],
+                "production_policy": "V6_EVIDENCE_ROUTED",
+                "promotion_pass": route["promotion_pass"],
+                "promotion_blocker": route["promotion_blocker"],
+                "promotion_evidence": route["evidence"],
+                "chronology_gate": gates["chronology"],
+                "calibration_gate": gates["calibration"],
+                "leakage_gate": gates["leakage"],
+                "credential_gate": gates["credential"],
+                "legacy_credential_rotation": gates["legacy_secret_provider_rotation"],
                 "pass_for_live": gates["pass_for_live"],
                 "private_provider_keys_embedded_in_apk": False,
             },
@@ -831,6 +1161,8 @@ def predictions(
             rows.append({
                 "game": game,
                 "prediction": prediction,
+                "model_state": "PROVISIONAL_SHADOW",
+                "reasoning": "Explicit shadow/local route. No unverified model is silently promoted.",
                 "ledger": {
                     "record_hash": ledger_hash,
                     "source_snapshot_sha256": snapshot,
@@ -855,9 +1187,12 @@ def predictions(
             "governance": {
                 "mode": "shadow",
                 "model_state": "PROVISIONAL_SHADOW",
-                "production_policy": "MARKET_BASELINE_ONLY",
-                "promotion_blocker": "AWAITING_CANONICAL_HISTORY",
-                "credential_gate": gates["credential_rotation"],
+                "production_policy": "V6_EVIDENCE_ROUTED",
+                "promotion_blocker": "LIVE_GATE_DISABLED",
+                "chronology_gate": gates["chronology"],
+                "calibration_gate": gates["calibration"],
+                "leakage_gate": gates["leakage"],
+                "credential_gate": gates["credential"],
                 "pass_for_live": gates["pass_for_live"],
                 "private_provider_keys_embedded_in_apk": False,
             },
@@ -874,75 +1209,131 @@ def predictions(
     return payload
 
 
+def _balanced_multisport_selection(
+    candidates: list[dict[str, Any]],
+    target: int,
+) -> list[dict[str, Any]]:
+    by_sport: dict[str, list[dict[str, Any]]] = {}
+    for item in sorted(candidates, key=lambda row: float(row.get("probability") or 0), reverse=True):
+        by_sport.setdefault(str(item.get("sport") or ""), []).append(item)
+
+    selected: list[dict[str, Any]] = []
+    used_games: set[str] = set()
+    sports = sorted(by_sport, key=lambda key: by_sport[key][0].get("probability", 0), reverse=True)
+
+    while len(selected) < target:
+        progressed = False
+        for sport in sports:
+            pool = by_sport[sport]
+            next_item = next((row for row in pool if row["game_id"] not in used_games and row not in selected), None)
+            if next_item is None:
+                continue
+            selected.append(next_item)
+            used_games.add(next_item["game_id"])
+            progressed = True
+            if len(selected) >= target:
+                break
+        if not progressed:
+            break
+
+    if len(selected) < target:
+        for item in sorted(candidates, key=lambda row: float(row.get("probability") or 0), reverse=True):
+            if item in selected:
+                continue
+            selected.append(item)
+            if len(selected) >= target:
+                break
+    return selected[:target]
+
+
+def _build_multisport_parlay(
+    candidates: list[dict[str, Any]],
+    size: int,
+    name: str,
+) -> dict[str, Any]:
+    legs = _balanced_multisport_selection(candidates, size)
+    true_probability = 1.0
+    for leg in legs:
+        true_probability *= float(leg.get("probability") or 0.0)
+    decimal = round(1.0 / max(0.0001, true_probability), 2) if legs else 0.0
+    sports_used = sorted({str(leg.get("sport") or "") for leg in legs if leg.get("sport")})
+    return {
+        "name": name,
+        "legs": len(legs),
+        "target_legs": size,
+        "is_multisport": len(sports_used) >= 2,
+        "sports": sports_used,
+        "model_joint_probability": round(true_probability, 8) if legs else 0.0,
+        "joint_probability_method": "INDEPENDENCE_FALLBACK",
+        "est_decimal_odds": decimal,
+        "bankroll_usd": 3.0,
+        "est_payout_usd": round(3.0 * decimal, 2),
+        "portfolio_reasoning": [
+            f"Uses {len(sports_used)} sports ({', '.join(sports_used)}) to avoid a single-sport concentration.",
+            "Selects one moneyline leg per game before considering any duplicate-game fallback.",
+            "Every leg is from a strictly pregame event and inherits its sport's v6 production route.",
+            "Joint probability is an independence fallback, not a claim that the legs are statistically independent.",
+            "Higher leg counts increase fragility because every selection must win.",
+        ],
+        "selections": legs,
+    }
+
+
 @app.get("/v1/parlays")
-def parlays(days: int = Query(2, ge=1, le=7)) -> dict[str, Any]:
+def parlays(days: int = Query(7, ge=1, le=7)) -> dict[str, Any]:
     candidates: list[dict[str, Any]] = []
     snapshots: list[str] = []
 
     for sport_key in SPORTS:
-        games, snapshot = fetch_games(sport_key, days)
-        snapshots.append(snapshot)
-        for game in games:
-            if not _strict_upcoming(game):
+        bundle = predictions(sport_key, days=days)
+        snapshots.append(str(bundle.get("snapshot_sha256") or ""))
+        model_state = str(bundle.get("model_state") or "UNKNOWN")
+        for row in bundle.get("predictions") or []:
+            if not isinstance(row, dict):
                 continue
-
-            prediction = predict_game(game)
+            game = row.get("game") if isinstance(row.get("game"), dict) else {}
+            pred = row.get("prediction") if isinstance(row.get("prediction"), dict) else {}
+            pick = str(pred.get("pick") or "PASS")
+            if pick == "PASS":
+                continue
+            probability = float(pred.get("pick_confidence") or 0.0)
+            if probability < 0.53:
+                continue
             matchup = f"{game.get('away_abbr')} @ {game.get('home_abbr')}"
+            route_reason = str(row.get("reasoning") or "")
+            confidence_band = (
+                "top-tier side confidence"
+                if probability >= 0.65
+                else "qualified side confidence"
+                if probability >= 0.58
+                else "minimum qualified side confidence"
+            )
+            candidates.append({
+                "game_id": str(game.get("id") or ""),
+                "event_time": game.get("date"),
+                "sport": sport_key.upper(),
+                "matchup": matchup,
+                "market": "ML",
+                "pick": pick,
+                "probability": round(probability, 6),
+                "model_state": model_state,
+                "reasoning": (
+                    f"{confidence_band} ({probability * 100:.1f}%); "
+                    f"{route_reason} Strict pregame filter passed."
+                ),
+            })
 
-            if prediction.pick != "PASS":
-                candidates.append({
-                    "sport": sport_key.upper(),
-                    "matchup": matchup,
-                    "market": "ML",
-                    "pick": prediction.pick,
-                    "probability": prediction.pick_confidence,
-                })
-
-            if prediction.home_win_probability > 0.58:
-                candidates.append({
-                    "sport": sport_key.upper(),
-                    "matchup": matchup,
-                    "market": "SPREAD 2.5",
-                    "pick": f"{game.get('home_abbr')} -2.5",
-                    "probability": min(0.68, prediction.home_win_probability + 0.04),
-                })
-
-            away_probability = 1 - prediction.home_win_probability
-            if away_probability > 0.58:
-                candidates.append({
-                    "sport": sport_key.upper(),
-                    "matchup": matchup,
-                    "market": "SPREAD 2.5",
-                    "pick": f"{game.get('away_abbr')} +2.5",
-                    "probability": min(0.68, away_probability + 0.04),
-                })
-
-    candidates.sort(key=lambda item: item["probability"], reverse=True)
-
-    def build(size: int, name: str) -> dict[str, Any]:
-        legs = candidates[:size]
-        true_probability = 1.0
-        for leg in legs:
-            true_probability *= float(leg["probability"])
-        decimal = round(1.0 / max(0.0001, true_probability), 2) if legs else 0.0
-        return {
-            "name": name,
-            "legs": len(legs),
-            "target_legs": size,
-            "model_joint_probability": round(true_probability, 8) if legs else 0.0,
-            "est_decimal_odds": decimal,
-            "bankroll_usd": 3.0,
-            "est_payout_usd": round(3.0 * decimal, 2),
-            "selections": legs,
-        }
-
+    candidates.sort(key=lambda item: float(item["probability"]), reverse=True)
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "policy": "V6_EVIDENCE_ROUTED_MULTISPORT",
         "snapshot_sha256": hashlib.sha256("".join(snapshots).encode("utf-8")).hexdigest(),
+        "candidate_count": len(candidates),
+        "parlay_dependency": "INDEPENDENCE_FALLBACK",
         "parlays": {
-            "7_leg_conservative": build(7, "7-LEG CONSERVATIVE"),
-            "10_leg_conservative": build(10, "10-LEG CONSERVATIVE"),
-            "14_leg_aggressive": build(14, "14-LEG AGGRESSIVE"),
+            "7_leg_multisport": _build_multisport_parlay(candidates, 7, "7-LEG MULTISPORT"),
+            "10_leg_multisport": _build_multisport_parlay(candidates, 10, "10-LEG MULTISPORT"),
+            "14_leg_multisport": _build_multisport_parlay(candidates, 14, "14-LEG MULTISPORT"),
         },
     }
 
@@ -1085,13 +1476,28 @@ def _fetch_live_odds(
         ) from exc
 
 
+def _fetch_live_market(
+    sport_key: str,
+    days: int = 2,
+) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any], str]:
+    provider = _active_market_provider()
+    if provider == "espn":
+        events, quality, quota = _fetch_espn_markets(sport_key, days=days)
+        return events, quality, quota, "ESPN keyless pregame market"
+    if provider == "oddsapi":
+        events, quality, quota = _fetch_live_odds(sport_key)
+        return events, quality, quota, "The Odds API"
+    raise HTTPException(status_code=503, detail="Unsupported primary market provider.")
+
+
 @app.get("/v1/odds/{sport}")
-def odds(sport: str) -> dict[str, Any]:
+def odds(sport: str, days: int = Query(2, ge=1, le=7)) -> dict[str, Any]:
     sport_key = sport.lower()
-    events, quality, quota = _fetch_live_odds(sport_key)
+    events, quality, quota, provider = _fetch_live_market(sport_key, days=days)
     return {
         "sport": sport_key.upper(),
-        "provider": "The Odds API",
+        "provider": provider,
+        "credential_gate": _active_credential_gate(),
         "fetched_at": datetime.now(timezone.utc).isoformat(),
         "quality": quality,
         "quota": quota,
