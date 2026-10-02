@@ -15,12 +15,12 @@ services:
       - key: CREDENTIAL_ROTATION_CONFIRMED
         value: "false"
       - key: PHILTHY_LIVE_ENABLED
-        value: "false"
+        value: "true"
       - key: PHILTHY_ENGINE_MODE
-        value: market_baseline_only
+        value: v6_evidence_routed
+      - key: PHILTHY_PRIMARY_MARKET_PROVIDER
+        value: espn
       - key: PHILTHY_RUNTIME_DIR
         value: /tmp/philthysports
       - key: ODDS_MAX_AGE_MINUTES
         value: "15"
-      - key: ODDS_API_KEY
-        sync: false
