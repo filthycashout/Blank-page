@@ -1,0 +1,40 @@
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+.cloudflared/
+.whatsapp-session/
+whatsapp_store/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Node / React
+node_modules/
+whatsapp-mcp/whatsapp-dashboard/dist/
+npm-debug.log*
+yarn-debug.log*
+.pnpm-debug.log
+
+# Logs, runtime files, and backups
+*.log
+*.pid
+*.sock
+n8n_postgres_backups/
+*.sql
+*.dump
+
+# Local Docker overrides
+docker-compose.override.yml
+
+# OS and editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
