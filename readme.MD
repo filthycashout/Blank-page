@@ -19,8 +19,8 @@ This repo sets up:
 ## 📦 1. Clone Repository
 
 ```bash
-git clone https://github.com/Zie619/automation-stack.git
-cd automation-stack
+git clone https://github.com/filthycashout/Blank-page.git
+cd Blank-page
 ```
 
 ---
@@ -113,7 +113,13 @@ cloudflared tunnel run n8n-tunnel-example
 
 ## 🔐 3. Setup .env File
 
-Create a `.env` file in the root folder:
+Copy the tracked template to a local, untracked `.env` file and replace every example credential with a strong, unique value:
+
+```bash
+cp .env.example .env
+```
+
+Never commit `.env`, real passwords, tunnel credentials, or session data. Do not expose the n8n or WhatsApp MCP ports directly to the public internet; use a correctly configured HTTPS tunnel and strong authentication.
 
 ```env
 # PostgreSQL
